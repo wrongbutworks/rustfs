@@ -11,7 +11,7 @@ an explicit opt-in mode is configured.
 | Walker | `walker` | Yes | Live `xl.meta` | Strong default ListObjectsV2 path | Enabled |
 | Key-only index | `index_key_only` | No | Index proposes keys; live `xl.meta` verifies objects | Strong only after live verification | Prototype gate only |
 | Verified-page index | `index_verified_page` | No | Index proposes pages; live `xl.meta` verifies objects | Strong only after live verification | Prototype gate only |
-| Metadata-fast index | `index_metadata_fast` | No | Index snapshot metadata | Eventually consistent only | Phase 7 guardrail gate only |
+| Metadata-fast index | `index_metadata_fast` | No | Index snapshot metadata | Eventually consistent only | Phase 7 prototype serving gate only |
 
 Never present `index_metadata_fast` as equivalent to the default S3-compatible
 walker path. It requires a separate staleness SLA, chaos evidence, and an
@@ -41,9 +41,18 @@ RUSTFS_LIST_OBJECTS_METADATA_FAST_STALENESS_MS=5000
 
 The staleness budget must be between `1` and `60000` milliseconds. Missing,
 disabled, invalid, or over-budget metadata-fast settings keep the default walker
-path. In the current Phase 7 prototype, passing this gate only proves operator
-configuration and fallback attribution; metadata snapshot serving is still not
-available and must fall back with `metadata_fast_unavailable`.
+path. The current Phase 7 prototype only serves metadata-fast from the
+`persistent_key_only` provider after a live walker rebuild has written metadata
+snapshot rows into the persistent index.
+
+Metadata-fast must fall back to walker when any of these guardrails fail:
+
+- provider is missing or is not `persistent_key_only`
+- namespace mutation journal is degraded or unreadable
+- index checkpoint does not cover the current journal high-water mark
+- continuation token generation does not match the active index generation
+- persistent index was created by an older key-only writer and lacks complete
+  metadata snapshot rows
 
 ## Immediate Rollback
 
@@ -111,7 +120,8 @@ Recommended alerts before any index-backed serving rollout:
 | Lifecycle state is `degraded` | Critical | Roll back to walker and inspect health reason |
 | Lifecycle state is `corrupt` | Critical | Roll back, discard generation, rebuild from walker/live metadata |
 | Metadata-fast enabled without SLA evidence | Critical | Disable immediately |
-| Metadata-fast fallback reason is not `metadata_fast_unavailable` in prototype | Critical | Disable immediately and inspect mode selection |
+| Metadata-fast fallback reason is `metadata_fast_unavailable` | Warning | Rebuild the persistent provider with metadata snapshot rows |
+| Metadata-fast serves while lifecycle is lagging/degraded/corrupt | Critical | Disable immediately and inspect journal/checkpoint guardrails |
 
 ## Compatibility Matrix
 
@@ -135,6 +145,8 @@ or release tracker.
 - `cargo test -p rustfs-io-metrics list_objects_metrics`
 - `cargo test -p rustfs-ecstore list_index`
 - `cargo test -p rustfs-ecstore verified_index_candidates`
+- `cargo test -p rustfs-ecstore metadata_snapshot`
+- `cargo test -p rustfs-ecstore metadata_fast`
 - `cargo test -p rustfs-ecstore list_objects`
 - `cargo fmt --all --check`
 - Benchmark large bucket walker baseline.
@@ -168,8 +180,8 @@ Canary must stop immediately if:
 - mutation lag exceeds the configured staleness budget
 - continuation tokens duplicate or skip objects
 - metadata-fast appears on a strong-consistency response path
-- metadata-fast serves from index metadata before chaos tests prove bounded stale
-  behavior
+- metadata-fast serves without a healthy journal, matching generation, complete
+  metadata snapshot, and checkpoint coverage
 
 ## Maintainer Notes
 
