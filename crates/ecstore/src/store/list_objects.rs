@@ -268,6 +268,9 @@ const ENV_API_LIST_OBJECTS_INDEX_PROVIDER: &str = "RUSTFS_LIST_OBJECTS_INDEX_PRO
 const ENV_API_LIST_OBJECTS_INDEX_PROVIDER_PATH: &str = "RUSTFS_LIST_OBJECTS_INDEX_PROVIDER_PATH";
 const ENV_API_LIST_OBJECTS_INDEX_PROVIDER_GENERATION: &str = "RUSTFS_LIST_OBJECTS_INDEX_PROVIDER_GENERATION";
 const ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_PATH: &str = "RUSTFS_LIST_OBJECTS_NAMESPACE_JOURNAL_PATH";
+const ENV_API_LIST_OBJECTS_METADATA_FAST_ENABLED: &str = "RUSTFS_LIST_OBJECTS_METADATA_FAST_ENABLED";
+const ENV_API_LIST_OBJECTS_METADATA_FAST_STALENESS_MS: &str = "RUSTFS_LIST_OBJECTS_METADATA_FAST_STALENESS_MS";
+const MAX_LIST_OBJECTS_METADATA_FAST_STALENESS_MS: u64 = 60_000;
 const LIST_OBJECTS_INDEX_PROVIDER_WALKER_KEY_ONLY: &str = "walker_key_only";
 const LIST_OBJECTS_INDEX_PROVIDER_PERSISTENT_KEY_ONLY: &str = "persistent_key_only";
 const LIST_OBJECTS_INDEX_PROVIDER_PERSISTENT_KEY_ONLY_DEFAULT_GENERATION: &str = "persistent-key-only";
@@ -359,6 +362,7 @@ enum ListIndexFallbackReason {
     MissingGeneration,
     GenerationMismatch,
     UnsupportedRequest,
+    MetadataFastUnavailable,
 }
 
 impl ListIndexFallbackReason {
@@ -373,6 +377,7 @@ impl ListIndexFallbackReason {
             Self::MissingGeneration => "missing_generation",
             Self::GenerationMismatch => "generation_mismatch",
             Self::UnsupportedRequest => "unsupported_request",
+            Self::MetadataFastUnavailable => "metadata_fast_unavailable",
         }
     }
 }
@@ -1641,9 +1646,29 @@ fn list_objects_index_mode_from_env() -> Option<ListSourceMode> {
         Some(ListSourceMode::IndexKeyOnly)
     } else if value.eq_ignore_ascii_case(LIST_CURSOR_SOURCE_INDEX_VERIFIED_PAGE) || value.eq_ignore_ascii_case("verified_page") {
         Some(ListSourceMode::IndexVerifiedPage)
+    } else if value.eq_ignore_ascii_case(LIST_CURSOR_SOURCE_INDEX_METADATA_FAST) || value.eq_ignore_ascii_case("metadata_fast") {
+        list_objects_metadata_fast_guardrails_from_env().map(|_| ListSourceMode::IndexMetadataFast)
     } else {
         None
     }
+}
+
+fn list_objects_metadata_fast_guardrails_from_env() -> Option<u64> {
+    let enabled = rustfs_utils::get_env_str(ENV_API_LIST_OBJECTS_METADATA_FAST_ENABLED, "");
+    let enabled = enabled.trim();
+    if !(enabled == "1"
+        || enabled.eq_ignore_ascii_case("true")
+        || enabled.eq_ignore_ascii_case("yes")
+        || enabled.eq_ignore_ascii_case("on"))
+    {
+        return None;
+    }
+
+    let staleness = rustfs_utils::get_env_str(ENV_API_LIST_OBJECTS_METADATA_FAST_STALENESS_MS, "");
+    let staleness_ms = staleness.trim().parse::<u64>().ok()?;
+    (1..=MAX_LIST_OBJECTS_METADATA_FAST_STALENESS_MS)
+        .contains(&staleness_ms)
+        .then_some(staleness_ms)
 }
 
 fn list_objects_index_provider_from_env() -> Option<ListObjectsIndexProviderKind> {
@@ -2830,6 +2855,19 @@ impl ECStore {
                 opts.separator.as_ref().is_some_and(|separator| !separator.is_empty()),
                 opts.marker.is_some(),
             );
+        }
+
+        if mode == ListSourceMode::IndexMetadataFast {
+            if list_metrics_enabled {
+                record_list_objects_index_fallback(mode, ListIndexFallbackReason::MetadataFastUnavailable);
+            }
+            debug!(
+                bucket = %opts.bucket,
+                prefix = %opts.prefix,
+                source = mode.cursor_value(),
+                "list_objects metadata-fast mode is gated but metadata snapshot serving is not available"
+            );
+            return Ok(None);
         }
 
         if incl_deleted || !mode.can_satisfy_strong_listing() || !mode.requires_live_metadata_verification() {
@@ -5839,13 +5877,15 @@ fn calc_common_counter(infos: &[DiskInfo], read_quorum: usize) -> u64 {
 mod test {
     use super::{
         ENV_API_LIST_OBJECTS_INDEX_MODE, ENV_API_LIST_OBJECTS_INDEX_PROVIDER, ENV_API_LIST_OBJECTS_INDEX_PROVIDER_GENERATION,
-        ENV_API_LIST_OBJECTS_INDEX_PROVIDER_PATH, ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_PATH, ENV_API_LIST_OBJECTS_QUORUM,
-        ENV_API_LIST_QUORUM, FallbackListingEntries, FallbackListingEntry, GatherResultsState, LIST_CURSOR_GENERATION_LIVE,
-        LIST_OBJECTS_INDEX_PROVIDER_PERSISTENT_KEY_ONLY, LIST_OBJECTS_INDEX_PROVIDER_WALKER_KEY_ONLY, ListIndexFallbackReason,
-        ListIndexLifecycle, ListIndexLifecycleState, ListIndexSourceDecision, ListMetadataAuthority, ListMetadataIndexGeneration,
-        ListMetadataIndexHealth, ListMetadataIndexKeyLookup, ListMetadataIndexPage, ListMetadataIndexPageIterator,
-        ListObjectsIndexProviderKind, ListObjectsIndexProviderState, ListPathOptions, ListPathRawOptions, ListSourceMode,
-        ListingEntryResolution, ListingSupplement, ListingSupplementOptions, MAX_OBJECT_LIST, NamespaceMutationJournalBackend,
+        ENV_API_LIST_OBJECTS_INDEX_PROVIDER_PATH, ENV_API_LIST_OBJECTS_METADATA_FAST_ENABLED,
+        ENV_API_LIST_OBJECTS_METADATA_FAST_STALENESS_MS, ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_PATH,
+        ENV_API_LIST_OBJECTS_QUORUM, ENV_API_LIST_QUORUM, FallbackListingEntries, FallbackListingEntry, GatherResultsState,
+        LIST_CURSOR_GENERATION_LIVE, LIST_OBJECTS_INDEX_PROVIDER_PERSISTENT_KEY_ONLY,
+        LIST_OBJECTS_INDEX_PROVIDER_WALKER_KEY_ONLY, ListIndexFallbackReason, ListIndexLifecycle, ListIndexLifecycleState,
+        ListIndexSourceDecision, ListMetadataAuthority, ListMetadataIndexGeneration, ListMetadataIndexHealth,
+        ListMetadataIndexKeyLookup, ListMetadataIndexPage, ListMetadataIndexPageIterator, ListObjectsIndexProviderKind,
+        ListObjectsIndexProviderState, ListPathOptions, ListPathRawOptions, ListSourceMode, ListingEntryResolution,
+        ListingSupplement, ListingSupplementOptions, MAX_OBJECT_LIST, NamespaceMutationJournalBackend,
         NamespaceMutationJournalSnapshot, NamespaceMutationJournalStatus, PersistentKeyOnlyIndex, VerifiedIndexCandidateStats,
         VersionMarker, current_list_objects_mutation_sequence, enforce_latest_listing_write_quorum,
         expand_ask_disks_for_object_quorum, fallback_entries_for_object, gather_results, latest_listing_allow_agreed_objects,
@@ -5853,14 +5893,15 @@ mod test {
         list_metadata_resolution_params, list_objects_from_verified_index_candidates,
         list_objects_from_verified_index_candidates_with_optional_stats, list_objects_from_verified_index_candidates_with_stats,
         list_objects_index_mode_from_env, list_objects_index_provider_from_env, list_objects_index_provider_state_from_env,
-        list_objects_key_only_provider_health, list_objects_quorum_from_env, list_quorum_from_env,
-        load_namespace_mutation_journal_state, load_persistent_key_only_index, max_keys_plus_one, merge_entry_channels,
-        normalize_list_quorum, observe_list_objects_mutations_with_store, parse_namespace_mutation_journal_state,
-        parse_persistent_key_only_index, parse_version_marker, persist_observed_list_objects_mutation,
-        persistent_key_only_index_health, persistent_key_only_index_matches_provider, record_list_objects_index_opt_in_fallback,
-        reset_list_objects_mutation_sequences_for_test, resolve_agreed_listing_entry, resolve_listing_entries,
-        select_list_index_provider_source_mode, select_list_index_source_mode, send_or_cancel, version_marker_for_entries,
-        walk_result_from_set_errors, write_namespace_mutation_journal_state, write_persistent_key_only_index,
+        list_objects_key_only_provider_health, list_objects_metadata_fast_guardrails_from_env, list_objects_quorum_from_env,
+        list_quorum_from_env, load_namespace_mutation_journal_state, load_persistent_key_only_index, max_keys_plus_one,
+        merge_entry_channels, normalize_list_quorum, observe_list_objects_mutations_with_store,
+        parse_namespace_mutation_journal_state, parse_persistent_key_only_index, parse_version_marker,
+        persist_observed_list_objects_mutation, persistent_key_only_index_health, persistent_key_only_index_matches_provider,
+        record_list_objects_index_opt_in_fallback, reset_list_objects_mutation_sequences_for_test, resolve_agreed_listing_entry,
+        resolve_listing_entries, select_list_index_provider_source_mode, select_list_index_source_mode, send_or_cancel,
+        version_marker_for_entries, walk_result_from_set_errors, write_namespace_mutation_journal_state,
+        write_persistent_key_only_index,
     };
     use crate::cache_value::metacache_set::{FallbackClaimTracker, TestReaderBehavior, list_path_raw};
     use crate::disk::{DiskAPI, DiskOption, endpoint::Endpoint, error::DiskError, new_disk};
@@ -6543,9 +6584,53 @@ mod test {
 
     #[test]
     #[serial_test::serial]
-    fn list_objects_index_mode_from_env_rejects_metadata_fast() {
+    fn list_objects_index_mode_from_env_rejects_metadata_fast_without_guardrails() {
         temp_env::with_var(ENV_API_LIST_OBJECTS_INDEX_MODE, Some("index_metadata_fast"), || {
-            assert_eq!(list_objects_index_mode_from_env(), None);
+            temp_env::with_var_unset(ENV_API_LIST_OBJECTS_METADATA_FAST_ENABLED, || {
+                temp_env::with_var_unset(ENV_API_LIST_OBJECTS_METADATA_FAST_STALENESS_MS, || {
+                    assert_eq!(list_objects_metadata_fast_guardrails_from_env(), None);
+                    assert_eq!(list_objects_index_mode_from_env(), None);
+                });
+            });
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn list_objects_index_mode_from_env_rejects_metadata_fast_without_sla() {
+        temp_env::with_var(ENV_API_LIST_OBJECTS_INDEX_MODE, Some("metadata_fast"), || {
+            temp_env::with_var(ENV_API_LIST_OBJECTS_METADATA_FAST_ENABLED, Some("true"), || {
+                temp_env::with_var_unset(ENV_API_LIST_OBJECTS_METADATA_FAST_STALENESS_MS, || {
+                    assert_eq!(list_objects_metadata_fast_guardrails_from_env(), None);
+                    assert_eq!(list_objects_index_mode_from_env(), None);
+                });
+            });
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn list_objects_index_mode_from_env_accepts_metadata_fast_with_sla_guardrails() {
+        temp_env::with_var(ENV_API_LIST_OBJECTS_INDEX_MODE, Some("index_metadata_fast"), || {
+            temp_env::with_var(ENV_API_LIST_OBJECTS_METADATA_FAST_ENABLED, Some("true"), || {
+                temp_env::with_var(ENV_API_LIST_OBJECTS_METADATA_FAST_STALENESS_MS, Some("5000"), || {
+                    assert_eq!(list_objects_metadata_fast_guardrails_from_env(), Some(5000));
+                    assert_eq!(list_objects_index_mode_from_env(), Some(ListSourceMode::IndexMetadataFast));
+                });
+            });
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn list_objects_index_mode_from_env_rejects_metadata_fast_over_sla_budget() {
+        temp_env::with_var(ENV_API_LIST_OBJECTS_INDEX_MODE, Some("index_metadata_fast"), || {
+            temp_env::with_var(ENV_API_LIST_OBJECTS_METADATA_FAST_ENABLED, Some("true"), || {
+                temp_env::with_var(ENV_API_LIST_OBJECTS_METADATA_FAST_STALENESS_MS, Some("60001"), || {
+                    assert_eq!(list_objects_metadata_fast_guardrails_from_env(), None);
+                    assert_eq!(list_objects_index_mode_from_env(), None);
+                });
+            });
         });
     }
 
