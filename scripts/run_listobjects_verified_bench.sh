@@ -30,7 +30,7 @@ SKIP_BUILD="${SKIP_BUILD:-false}"
 INDEX_PROVIDER="${INDEX_PROVIDER:-persistent_key_only}"
 INDEX_GENERATION="${INDEX_GENERATION:-bench-$(date +%Y%m%d%H%M%S)}"
 KEY_INDEX_PATH="${KEY_INDEX_PATH:-${OUT_DIR}/persistent-key-only.index}"
-NAMESPACE_JOURNAL_PATH="${NAMESPACE_JOURNAL_PATH:-${OUT_DIR}/namespace-mutation-journal}"
+NAMESPACE_JOURNAL_PATH="${NAMESPACE_JOURNAL_PATH:-}"
 PREBUILD_KEY_INDEX="${PREBUILD_KEY_INDEX:-false}"
 PREPARE_ONLY="${PREPARE_ONLY:-false}"
 REUSE_PREPARED_DATA="${REUSE_PREPARED_DATA:-false}"
@@ -66,7 +66,7 @@ Options:
   --skip-build           Use existing RustFS binary.
   --index-provider <v>   Opt-in provider (default: persistent_key_only).
   --key-index-path <p>   Persistent key-only index path.
-  --journal-path <p>     Namespace mutation journal path.
+  --journal-path <p>     Optional local namespace mutation journal override path.
   --prebuild-key-index   Build persistent key-only index from the bench script.
   --prepare-only         Prepare bucket data and exit without running modes.
   --reuse-prepared-data  Reuse --data-root and skip warp data preparation.
@@ -236,7 +236,9 @@ start_server() {
       if [[ "$INDEX_PROVIDER" == "persistent_key_only" || "$INDEX_PROVIDER" == "persisted_key_only" ]]; then
         export RUSTFS_LIST_OBJECTS_INDEX_PROVIDER_PATH="$KEY_INDEX_PATH"
         export RUSTFS_LIST_OBJECTS_INDEX_PROVIDER_GENERATION="$INDEX_GENERATION"
-        export RUSTFS_LIST_OBJECTS_NAMESPACE_JOURNAL_PATH="$NAMESPACE_JOURNAL_PATH"
+        if [[ -n "$NAMESPACE_JOURNAL_PATH" ]]; then
+          export RUSTFS_LIST_OBJECTS_NAMESPACE_JOURNAL_PATH="$NAMESPACE_JOURNAL_PATH"
+        fi
       fi
     fi
     exec "$RUSTFS_BIN" server \
@@ -656,7 +658,7 @@ write_manifest() {
     echo "index_provider=$INDEX_PROVIDER"
     echo "index_generation=$INDEX_GENERATION"
     echo "key_index_path=$KEY_INDEX_PATH"
-    echo "namespace_journal_path=$NAMESPACE_JOURNAL_PATH"
+    echo "namespace_journal_path=${NAMESPACE_JOURNAL_PATH:-.rustfs.sys/listobjects/ns-journal/v1}"
     echo "prebuild_key_index=$PREBUILD_KEY_INDEX"
     echo "prepare_only=$PREPARE_ONLY"
     echo "reuse_prepared_data=$REUSE_PREPARED_DATA"
