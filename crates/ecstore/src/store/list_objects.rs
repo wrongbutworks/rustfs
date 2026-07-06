@@ -266,6 +266,7 @@ const ENV_API_LIST_OBJECTS_INDEX_MODE: &str = "RUSTFS_LIST_OBJECTS_INDEX_MODE";
 const ENV_API_LIST_OBJECTS_INDEX_PROVIDER: &str = "RUSTFS_LIST_OBJECTS_INDEX_PROVIDER";
 const ENV_API_LIST_OBJECTS_INDEX_PROVIDER_PATH: &str = "RUSTFS_LIST_OBJECTS_INDEX_PROVIDER_PATH";
 const ENV_API_LIST_OBJECTS_INDEX_PROVIDER_GENERATION: &str = "RUSTFS_LIST_OBJECTS_INDEX_PROVIDER_GENERATION";
+const ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_PATH: &str = "RUSTFS_LIST_OBJECTS_NAMESPACE_JOURNAL_PATH";
 const LIST_OBJECTS_INDEX_PROVIDER_WALKER_KEY_ONLY: &str = "walker_key_only";
 const LIST_OBJECTS_INDEX_PROVIDER_PERSISTENT_KEY_ONLY: &str = "persistent_key_only";
 const LIST_OBJECTS_INDEX_PROVIDER_PERSISTENT_KEY_ONLY_DEFAULT_GENERATION: &str = "persistent-key-only";
@@ -273,9 +274,13 @@ const PERSISTENT_KEY_ONLY_INDEX_HEADER: &str = "# rustfs-listobjects-key-only-v1
 const PERSISTENT_KEY_ONLY_INDEX_BUCKET_HEADER: &str = "# bucket=";
 const PERSISTENT_KEY_ONLY_INDEX_GENERATION_HEADER: &str = "# generation=";
 const PERSISTENT_KEY_ONLY_INDEX_CHECKPOINT_HEADER: &str = "# checkpoint_high_water_mark=";
-const PERSISTENT_KEY_ONLY_MUTATION_HEADER: &str = "# rustfs-listobjects-mutation-v1";
-const PERSISTENT_KEY_ONLY_MUTATION_BUCKET_HEADER: &str = "# bucket=";
-const PERSISTENT_KEY_ONLY_MUTATION_HIGH_WATER_MARK_HEADER: &str = "# high_water_mark=";
+const LIST_OBJECTS_NAMESPACE_JOURNAL_HEADER: &str = "# rustfs-listobjects-namespace-journal-v1";
+const LIST_OBJECTS_NAMESPACE_JOURNAL_BUCKET_HEADER: &str = "# bucket=";
+const LIST_OBJECTS_NAMESPACE_JOURNAL_HIGH_WATER_MARK_HEADER: &str = "# high_water_mark=";
+const LIST_OBJECTS_NAMESPACE_JOURNAL_STATUS_HEADER: &str = "# status=";
+const LIST_OBJECTS_NAMESPACE_JOURNAL_STATUS_HEALTHY: &str = "healthy";
+const LIST_OBJECTS_NAMESPACE_JOURNAL_STATUS_DEGRADED: &str = "degraded";
+const LIST_OBJECTS_NAMESPACE_JOURNAL_DEFAULT_DIR: &str = "namespace-mutation-journal";
 
 /// Identifies the source that produced a ListObjects page.
 ///
@@ -461,9 +466,10 @@ struct PersistentKeyOnlyIndex {
 }
 
 static PERSISTENT_KEY_ONLY_INDEX_CACHE: OnceCell<RwLock<Option<PersistentKeyOnlyIndexCache>>> = OnceCell::const_new();
-static PERSISTENT_KEY_ONLY_MUTATION_STATE_LOCK: OnceCell<RwLock<()>> = OnceCell::const_new();
+static LIST_OBJECTS_NAMESPACE_JOURNAL_LOCK: OnceCell<RwLock<()>> = OnceCell::const_new();
 static LIST_OBJECTS_MUTATION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static LIST_OBJECTS_BUCKET_MUTATION_SEQUENCE: OnceCell<RwLock<HashMap<String, u64>>> = OnceCell::const_new();
+static LIST_OBJECTS_NAMESPACE_JOURNAL_DEGRADED_BUCKETS: OnceCell<RwLock<HashSet<String>>> = OnceCell::const_new();
 
 async fn persistent_key_only_index_cache() -> &'static RwLock<Option<PersistentKeyOnlyIndexCache>> {
     PERSISTENT_KEY_ONLY_INDEX_CACHE
@@ -471,8 +477,8 @@ async fn persistent_key_only_index_cache() -> &'static RwLock<Option<PersistentK
         .await
 }
 
-async fn persistent_key_only_mutation_state_lock() -> &'static RwLock<()> {
-    PERSISTENT_KEY_ONLY_MUTATION_STATE_LOCK
+async fn list_objects_namespace_journal_lock() -> &'static RwLock<()> {
+    LIST_OBJECTS_NAMESPACE_JOURNAL_LOCK
         .get_or_init(|| async { RwLock::new(()) })
         .await
 }
@@ -480,6 +486,12 @@ async fn persistent_key_only_mutation_state_lock() -> &'static RwLock<()> {
 async fn list_objects_bucket_mutation_sequence() -> &'static RwLock<HashMap<String, u64>> {
     LIST_OBJECTS_BUCKET_MUTATION_SEQUENCE
         .get_or_init(|| async { RwLock::new(HashMap::new()) })
+        .await
+}
+
+async fn list_objects_namespace_journal_degraded_buckets() -> &'static RwLock<HashSet<String>> {
+    LIST_OBJECTS_NAMESPACE_JOURNAL_DEGRADED_BUCKETS
+        .get_or_init(|| async { RwLock::new(HashSet::new()) })
         .await
 }
 
@@ -537,9 +549,7 @@ pub(super) async fn observe_list_objects_mutations(bucket: &str, count: usize) -
 }
 
 async fn current_list_objects_mutation_sequence(bucket: &str) -> u64 {
-    let sequences = list_objects_bucket_mutation_sequence().await;
-    let sequences = sequences.read().await;
-    sequences.get(bucket).copied().unwrap_or(0)
+    current_list_objects_mutation_snapshot(bucket).await.high_water_mark
 }
 
 #[cfg(test)]
@@ -547,107 +557,298 @@ async fn reset_list_objects_mutation_sequences_for_test() {
     LIST_OBJECTS_MUTATION_SEQUENCE.store(0, Ordering::Release);
     let sequences = list_objects_bucket_mutation_sequence().await;
     sequences.write().await.clear();
+    let degraded = list_objects_namespace_journal_degraded_buckets().await;
+    degraded.write().await.clear();
 }
 
-fn persistent_key_only_mutation_path(index_path: &Path, bucket: &str) -> PathBuf {
-    let mut mutation_path = index_path.to_path_buf();
-    let file_name = index_path
-        .file_name()
-        .and_then(|file_name| file_name.to_str())
-        .unwrap_or("persistent-key-only.index");
-    mutation_path.set_file_name(format!("{file_name}.{bucket}.mutation"));
-    mutation_path
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NamespaceMutationJournalStatus {
+    Healthy,
+    Degraded,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct PersistentKeyOnlyMutationState {
+struct NamespaceMutationJournalState {
     bucket: Option<String>,
     high_water_mark: u64,
+    status: NamespaceMutationJournalStatus,
 }
 
-fn parse_persistent_key_only_mutation_state(contents: &str) -> Option<PersistentKeyOnlyMutationState> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NamespaceMutationJournalSnapshot {
+    high_water_mark: u64,
+    degraded: bool,
+}
+
+fn parse_namespace_mutation_journal_state(contents: &str) -> Option<NamespaceMutationJournalState> {
     let mut bucket = None;
     let mut high_water_mark = None;
+    let mut status = NamespaceMutationJournalStatus::Healthy;
 
     for line in contents.lines() {
         let line = line.trim_end_matches('\r');
-        if line.is_empty() || line == PERSISTENT_KEY_ONLY_MUTATION_HEADER {
+        if line.is_empty() || line == LIST_OBJECTS_NAMESPACE_JOURNAL_HEADER {
             continue;
         }
-        if let Some(value) = line.strip_prefix(PERSISTENT_KEY_ONLY_MUTATION_BUCKET_HEADER) {
+        if let Some(value) = line.strip_prefix(LIST_OBJECTS_NAMESPACE_JOURNAL_BUCKET_HEADER) {
             if !value.is_empty() {
                 bucket = Some(value.to_owned());
             }
             continue;
         }
-        if let Some(value) = line.strip_prefix(PERSISTENT_KEY_ONLY_MUTATION_HIGH_WATER_MARK_HEADER) {
+        if let Some(value) = line.strip_prefix(LIST_OBJECTS_NAMESPACE_JOURNAL_HIGH_WATER_MARK_HEADER) {
             high_water_mark = value.parse::<u64>().ok();
+            continue;
+        }
+        if let Some(value) = line.strip_prefix(LIST_OBJECTS_NAMESPACE_JOURNAL_STATUS_HEADER) {
+            status = match value {
+                LIST_OBJECTS_NAMESPACE_JOURNAL_STATUS_HEALTHY => NamespaceMutationJournalStatus::Healthy,
+                LIST_OBJECTS_NAMESPACE_JOURNAL_STATUS_DEGRADED => NamespaceMutationJournalStatus::Degraded,
+                _ => return None,
+            };
         }
     }
 
-    high_water_mark.map(|high_water_mark| PersistentKeyOnlyMutationState { bucket, high_water_mark })
+    high_water_mark.map(|high_water_mark| NamespaceMutationJournalState {
+        bucket,
+        high_water_mark,
+        status,
+    })
 }
 
-async fn load_persistent_key_only_mutation_sequence(index_path: &Path, bucket: &str) -> Result<Option<u64>> {
-    let mutation_path = persistent_key_only_mutation_path(index_path, bucket);
-    let lock = persistent_key_only_mutation_state_lock().await;
-    // Sidecar IO is serialized without taking any other locks so the persisted high-water mark cannot regress.
+fn namespace_mutation_journal_path(root: &Path, bucket: &str) -> PathBuf {
+    root.join(format!("{bucket}.state"))
+}
+
+fn list_objects_namespace_journal_root_from_env() -> Option<PathBuf> {
+    std::env::var_os(ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_PATH)
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+}
+
+fn list_objects_namespace_journal_root_from_provider_path(provider_path: &Path) -> Option<PathBuf> {
+    provider_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map(|parent| parent.join(LIST_OBJECTS_NAMESPACE_JOURNAL_DEFAULT_DIR))
+}
+
+fn list_objects_namespace_journal_root_from_env_or_provider_path(provider_path: &Path) -> Option<PathBuf> {
+    list_objects_namespace_journal_root_from_env()
+        .or_else(|| list_objects_namespace_journal_root_from_provider_path(provider_path))
+}
+
+fn configured_list_objects_namespace_journal_root() -> Option<PathBuf> {
+    list_objects_namespace_journal_root_from_env().or_else(|| {
+        list_objects_index_provider_path_from_env().and_then(|path| list_objects_namespace_journal_root_from_provider_path(&path))
+    })
+}
+
+async fn load_namespace_mutation_journal_state(root: &Path, bucket: &str) -> Result<Option<NamespaceMutationJournalState>> {
+    let journal_path = namespace_mutation_journal_path(root, bucket);
+    let lock = list_objects_namespace_journal_lock().await;
+    // Journal IO is serialized and does not take provider/index locks, preserving high-water monotonicity.
     let _guard = lock.read().await;
-    let contents = match tokio::fs::read_to_string(&mutation_path).await {
+    let contents = match tokio::fs::read_to_string(&journal_path).await {
         Ok(contents) => contents,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(Error::Io(err)),
     };
-    Ok(parse_persistent_key_only_mutation_state(&contents).and_then(|state| {
-        state
-            .bucket
-            .as_deref()
-            .is_none_or(|persisted_bucket| persisted_bucket == bucket)
-            .then_some(state.high_water_mark)
-    }))
+    let Some(state) = parse_namespace_mutation_journal_state(&contents) else {
+        return Err(Error::other("list objects namespace mutation journal state is corrupt"));
+    };
+    if state
+        .bucket
+        .as_deref()
+        .is_some_and(|persisted_bucket| persisted_bucket != bucket)
+    {
+        return Err(Error::other("list objects namespace mutation journal bucket mismatch"));
+    }
+    Ok(Some(state))
 }
 
-async fn write_persistent_key_only_mutation_sequence(index_path: &Path, bucket: &str, sequence: u64) -> Result<u64> {
-    let mutation_path = persistent_key_only_mutation_path(index_path, bucket);
-    let lock = persistent_key_only_mutation_state_lock().await;
-    // Sidecar IO is serialized without taking any other locks so the persisted high-water mark cannot regress.
-    let _guard = lock.write().await;
+async fn write_namespace_mutation_journal_state(
+    root: &Path,
+    bucket: &str,
+    sequence: u64,
+    clear_degraded: bool,
+) -> Result<NamespaceMutationJournalSnapshot> {
+    let journal_path = namespace_mutation_journal_path(root, bucket);
+    let lock = list_objects_namespace_journal_lock().await;
+    // Journal IO is serialized and does not take provider/index locks, preserving high-water monotonicity.
+    let guard = lock.write().await;
 
-    let persisted_sequence = match tokio::fs::read_to_string(&mutation_path).await {
-        Ok(contents) => parse_persistent_key_only_mutation_state(&contents)
-            .and_then(|state| {
-                state
-                    .bucket
-                    .as_deref()
-                    .is_none_or(|persisted_bucket| persisted_bucket == bucket)
-                    .then_some(state.high_water_mark)
-            })
-            .unwrap_or(0),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => 0,
+    let persisted_state = match tokio::fs::read_to_string(&journal_path).await {
+        Ok(contents) => {
+            let Some(state) = parse_namespace_mutation_journal_state(&contents) else {
+                return Err(Error::other("list objects namespace mutation journal state is corrupt"));
+            };
+            if state
+                .bucket
+                .as_deref()
+                .is_some_and(|persisted_bucket| persisted_bucket != bucket)
+            {
+                return Err(Error::other("list objects namespace mutation journal bucket mismatch"));
+            }
+            Some(state)
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
         Err(err) => return Err(Error::Io(err)),
     };
+    let persisted_sequence = persisted_state.as_ref().map(|state| state.high_water_mark).unwrap_or(0);
+    let degraded = persisted_state
+        .as_ref()
+        .is_some_and(|state| state.status == NamespaceMutationJournalStatus::Degraded)
+        && !clear_degraded;
     let sequence = sequence.max(persisted_sequence);
 
-    if let Some(parent) = mutation_path.parent()
+    if let Some(parent) = journal_path.parent()
         && !parent.as_os_str().is_empty()
     {
         tokio::fs::create_dir_all(parent).await.map_err(Error::Io)?;
     }
 
     let mut contents = String::new();
-    contents.push_str(PERSISTENT_KEY_ONLY_MUTATION_HEADER);
+    contents.push_str(LIST_OBJECTS_NAMESPACE_JOURNAL_HEADER);
     contents.push('\n');
-    contents.push_str(PERSISTENT_KEY_ONLY_MUTATION_BUCKET_HEADER);
+    contents.push_str(LIST_OBJECTS_NAMESPACE_JOURNAL_BUCKET_HEADER);
     contents.push_str(bucket);
     contents.push('\n');
-    contents.push_str(PERSISTENT_KEY_ONLY_MUTATION_HIGH_WATER_MARK_HEADER);
+    contents.push_str(LIST_OBJECTS_NAMESPACE_JOURNAL_HIGH_WATER_MARK_HEADER);
     contents.push_str(&sequence.to_string());
     contents.push('\n');
+    contents.push_str(LIST_OBJECTS_NAMESPACE_JOURNAL_STATUS_HEADER);
+    contents.push_str(if degraded {
+        LIST_OBJECTS_NAMESPACE_JOURNAL_STATUS_DEGRADED
+    } else {
+        LIST_OBJECTS_NAMESPACE_JOURNAL_STATUS_HEALTHY
+    });
+    contents.push('\n');
 
-    let tmp_path = mutation_path.with_extension("mutation.tmp");
+    let tmp_path = journal_path.with_extension("tmp");
     tokio::fs::write(&tmp_path, contents).await.map_err(Error::Io)?;
-    tokio::fs::rename(&tmp_path, &mutation_path).await.map_err(Error::Io)?;
-    Ok(sequence)
+    tokio::fs::rename(&tmp_path, &journal_path).await.map_err(Error::Io)?;
+    drop(guard);
+    if clear_degraded {
+        let degraded = list_objects_namespace_journal_degraded_buckets().await;
+        degraded.write().await.remove(bucket);
+    }
+    Ok(NamespaceMutationJournalSnapshot {
+        high_water_mark: sequence,
+        degraded,
+    })
+}
+
+async fn mark_namespace_mutation_journal_degraded(bucket: &str, sequence: u64) {
+    let degraded = list_objects_namespace_journal_degraded_buckets().await;
+    degraded.write().await.insert(bucket.to_owned());
+
+    if let Some(root) = configured_list_objects_namespace_journal_root()
+        && let Err(err) = write_namespace_mutation_journal_degraded_state(&root, bucket, sequence).await
+    {
+        warn!(
+            bucket = %bucket,
+            sequence,
+            journal_root = %root.display(),
+            error = %err,
+            "failed to persist degraded namespace mutation journal state"
+        );
+    }
+}
+
+async fn write_namespace_mutation_journal_degraded_state(root: &Path, bucket: &str, sequence: u64) -> Result<()> {
+    let journal_path = namespace_mutation_journal_path(root, bucket);
+    let lock = list_objects_namespace_journal_lock().await;
+    // Journal IO is serialized and does not take provider/index locks, preserving high-water monotonicity.
+    let _guard = lock.write().await;
+
+    let persisted_sequence = match tokio::fs::read_to_string(&journal_path).await {
+        Ok(contents) => parse_namespace_mutation_journal_state(&contents)
+            .filter(|state| {
+                state
+                    .bucket
+                    .as_deref()
+                    .is_none_or(|persisted_bucket| persisted_bucket == bucket)
+            })
+            .map(|state| state.high_water_mark)
+            .unwrap_or(0),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(err) => return Err(Error::Io(err)),
+    };
+    let sequence = sequence.max(persisted_sequence);
+
+    if let Some(parent) = journal_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        tokio::fs::create_dir_all(parent).await.map_err(Error::Io)?;
+    }
+
+    let mut contents = String::new();
+    contents.push_str(LIST_OBJECTS_NAMESPACE_JOURNAL_HEADER);
+    contents.push('\n');
+    contents.push_str(LIST_OBJECTS_NAMESPACE_JOURNAL_BUCKET_HEADER);
+    contents.push_str(bucket);
+    contents.push('\n');
+    contents.push_str(LIST_OBJECTS_NAMESPACE_JOURNAL_HIGH_WATER_MARK_HEADER);
+    contents.push_str(&sequence.to_string());
+    contents.push('\n');
+    contents.push_str(LIST_OBJECTS_NAMESPACE_JOURNAL_STATUS_HEADER);
+    contents.push_str(LIST_OBJECTS_NAMESPACE_JOURNAL_STATUS_DEGRADED);
+    contents.push('\n');
+
+    let tmp_path = journal_path.with_extension("tmp");
+    tokio::fs::write(&tmp_path, contents).await.map_err(Error::Io)?;
+    tokio::fs::rename(&tmp_path, &journal_path).await.map_err(Error::Io)?;
+    Ok(())
+}
+
+async fn current_list_objects_mutation_snapshot(bucket: &str) -> NamespaceMutationJournalSnapshot {
+    let sequences = list_objects_bucket_mutation_sequence().await;
+    let in_memory_sequence = {
+        let sequences = sequences.read().await;
+        sequences.get(bucket).copied().unwrap_or(0)
+    };
+
+    let degraded = list_objects_namespace_journal_degraded_buckets().await;
+    let in_memory_degraded = {
+        let degraded = degraded.read().await;
+        degraded.contains(bucket)
+    };
+
+    let Some(root) = configured_list_objects_namespace_journal_root() else {
+        return NamespaceMutationJournalSnapshot {
+            high_water_mark: in_memory_sequence,
+            degraded: in_memory_degraded,
+        };
+    };
+
+    match load_namespace_mutation_journal_state(&root, bucket).await {
+        Ok(Some(state)) => {
+            advance_list_objects_mutation_sequence(bucket, state.high_water_mark).await;
+            NamespaceMutationJournalSnapshot {
+                high_water_mark: in_memory_sequence.max(state.high_water_mark),
+                degraded: in_memory_degraded || state.status == NamespaceMutationJournalStatus::Degraded,
+            }
+        }
+        Ok(None) => NamespaceMutationJournalSnapshot {
+            high_water_mark: in_memory_sequence,
+            degraded: in_memory_degraded,
+        },
+        Err(err) => {
+            warn!(
+                bucket = %bucket,
+                journal_root = %root.display(),
+                error = %err,
+                "list objects namespace mutation journal could not be loaded; falling back to walker"
+            );
+            let degraded = list_objects_namespace_journal_degraded_buckets().await;
+            degraded.write().await.insert(bucket.to_owned());
+            NamespaceMutationJournalSnapshot {
+                high_water_mark: in_memory_sequence,
+                degraded: true,
+            }
+        }
+    }
 }
 
 async fn invalidate_persistent_key_only_index(path: &Path) {
@@ -684,14 +885,19 @@ async fn persist_observed_list_objects_mutation(bucket: &str, sequence: u64) {
         return;
     };
 
-    if let Err(err) = write_persistent_key_only_mutation_sequence(&path, bucket, sequence).await {
+    let Some(root) = list_objects_namespace_journal_root_from_env_or_provider_path(&path) else {
+        return;
+    };
+
+    if let Err(err) = write_namespace_mutation_journal_state(&root, bucket, sequence, false).await {
         warn!(
             bucket = %bucket,
             sequence,
-            index_path = %path.display(),
+            journal_root = %root.display(),
             error = %err,
-            "persistent key-only mutation checkpoint persist failed; invalidating index snapshot"
+            "namespace mutation journal commit failed; degrading persistent key-only provider"
         );
+        mark_namespace_mutation_journal_degraded(bucket, sequence).await;
         invalidate_persistent_key_only_index(&path).await;
     }
 }
@@ -744,12 +950,19 @@ fn parse_persistent_key_only_index(contents: &str) -> PersistentKeyOnlyIndex {
     }
 }
 
-fn persistent_key_only_index_health(index: &PersistentKeyOnlyIndex, current_mutation_sequence: u64) -> ListIndexHealthSnapshot {
+fn persistent_key_only_index_health(
+    index: &PersistentKeyOnlyIndex,
+    mutation_snapshot: NamespaceMutationJournalSnapshot,
+) -> ListIndexHealthSnapshot {
     let mut lifecycle = ListIndexLifecycle::disabled(0);
-    let mutation_high_water_mark = current_mutation_sequence.max(index.checkpoint_high_water_mark);
+    let mutation_high_water_mark = mutation_snapshot.high_water_mark.max(index.checkpoint_high_water_mark);
     lifecycle.begin_rebuild(&index.generation, mutation_high_water_mark);
     lifecycle.checkpoint_rebuild(index.checkpoint_high_water_mark);
     let _ = lifecycle.publish_rebuild();
+    if mutation_snapshot.degraded {
+        lifecycle.mark_degraded();
+        return lifecycle.health_snapshot();
+    }
     lifecycle.observe_mutation_high_water_mark(mutation_high_water_mark);
     lifecycle.health_snapshot()
 }
@@ -801,9 +1014,12 @@ async fn write_persistent_key_only_index(
         contents.push('\n');
     }
 
+    let Some(journal_root) = list_objects_namespace_journal_root_from_env_or_provider_path(path) else {
+        return Err(Error::other("list objects namespace mutation journal path is not configured"));
+    };
     let tmp_path = path.with_extension("tmp");
     tokio::fs::write(&tmp_path, contents).await.map_err(Error::Io)?;
-    write_persistent_key_only_mutation_sequence(path, bucket, checkpoint_high_water_mark).await?;
+    write_namespace_mutation_journal_state(&journal_root, bucket, checkpoint_high_water_mark, true).await?;
     tokio::fs::rename(&tmp_path, path).await.map_err(Error::Io)?;
 
     Ok(PersistentKeyOnlyIndex {
@@ -834,10 +1050,14 @@ async fn load_persistent_key_only_index(path: &Path) -> Result<Arc<PersistentKey
     let contents = tokio::fs::read_to_string(path).await.map_err(Error::Io)?;
     let index = Arc::new(parse_persistent_key_only_index(&contents));
     if let Some(bucket) = index.bucket.as_deref() {
-        let restored_sequence = load_persistent_key_only_mutation_sequence(path, bucket)
-            .await?
-            .unwrap_or(index.checkpoint_high_water_mark)
-            .max(index.checkpoint_high_water_mark);
+        let restored_sequence = match list_objects_namespace_journal_root_from_env_or_provider_path(path) {
+            Some(journal_root) => load_namespace_mutation_journal_state(&journal_root, bucket)
+                .await?
+                .map(|state| state.high_water_mark)
+                .unwrap_or(index.checkpoint_high_water_mark)
+                .max(index.checkpoint_high_water_mark),
+            None => index.checkpoint_high_water_mark,
+        };
         advance_list_objects_mutation_sequence(bucket, restored_sequence).await;
     }
     let mut cached = cache.write().await;
@@ -2312,19 +2532,25 @@ impl ECStore {
         const MAX_REBUILD_ATTEMPTS: usize = 3;
 
         for attempt in 1..=MAX_REBUILD_ATTEMPTS {
-            let start_sequence = current_list_objects_mutation_sequence(&opts.bucket).await;
+            let start_sequence = current_list_objects_mutation_snapshot(&opts.bucket).await;
+            if start_sequence.degraded {
+                return Err(Error::other("list objects namespace mutation journal is degraded"));
+            }
             let keys = self.clone().collect_persistent_key_only_index_keys(opts).await?;
-            let end_sequence = current_list_objects_mutation_sequence(&opts.bucket).await;
-            if start_sequence == end_sequence {
-                write_persistent_key_only_index(path, &opts.bucket, &generation, end_sequence, &keys).await?;
+            let end_sequence = current_list_objects_mutation_snapshot(&opts.bucket).await;
+            if end_sequence.degraded {
+                return Err(Error::other("list objects namespace mutation journal is degraded"));
+            }
+            if start_sequence.high_water_mark == end_sequence.high_water_mark {
+                write_persistent_key_only_index(path, &opts.bucket, &generation, end_sequence.high_water_mark, &keys).await?;
                 return load_persistent_key_only_index(path).await;
             }
 
             debug!(
                 bucket = %opts.bucket,
                 attempt,
-                start_sequence,
-                end_sequence,
+                start_sequence = start_sequence.high_water_mark,
+                end_sequence = end_sequence.high_water_mark,
                 "persistent key-only index rebuild raced with object mutations"
             );
         }
@@ -2345,8 +2571,8 @@ impl ECStore {
 
         match load_persistent_key_only_index(path).await {
             Ok(index) if index.bucket.as_deref().is_none_or(|bucket| bucket == opts.bucket) => {
-                let current_sequence = current_list_objects_mutation_sequence(&opts.bucket).await;
-                if current_sequence <= index.checkpoint_high_water_mark {
+                let current_sequence = current_list_objects_mutation_snapshot(&opts.bucket).await;
+                if !current_sequence.degraded && current_sequence.high_water_mark <= index.checkpoint_high_water_mark {
                     Ok(index)
                 } else {
                     self.rebuild_persistent_key_only_index(opts, path, provider_state.persistent_generation.as_deref())
@@ -2486,7 +2712,7 @@ impl ECStore {
                     .await
                 {
                     Ok(index) => {
-                        let current_sequence = current_list_objects_mutation_sequence(&provider_opts.bucket).await;
+                        let current_sequence = current_list_objects_mutation_snapshot(&provider_opts.bucket).await;
                         let health = persistent_key_only_index_health(&index, current_sequence);
                         match select_list_index_provider_source_mode(&provider_opts, mode, &health) {
                             ListIndexSourceDecision::FallbackToWalker(reason) => {
@@ -5396,27 +5622,28 @@ fn calc_common_counter(infos: &[DiskInfo], read_quorum: usize) -> u64 {
 mod test {
     use super::{
         ENV_API_LIST_OBJECTS_INDEX_MODE, ENV_API_LIST_OBJECTS_INDEX_PROVIDER, ENV_API_LIST_OBJECTS_INDEX_PROVIDER_GENERATION,
-        ENV_API_LIST_OBJECTS_INDEX_PROVIDER_PATH, ENV_API_LIST_OBJECTS_QUORUM, ENV_API_LIST_QUORUM, FallbackListingEntries,
-        FallbackListingEntry, GatherResultsState, LIST_CURSOR_GENERATION_LIVE, LIST_OBJECTS_INDEX_PROVIDER_PERSISTENT_KEY_ONLY,
-        LIST_OBJECTS_INDEX_PROVIDER_WALKER_KEY_ONLY, ListIndexFallbackReason, ListIndexLifecycle, ListIndexLifecycleState,
-        ListIndexSourceDecision, ListMetadataAuthority, ListMetadataIndexGeneration, ListMetadataIndexHealth,
-        ListMetadataIndexKeyLookup, ListMetadataIndexPage, ListMetadataIndexPageIterator, ListObjectsIndexProviderKind,
-        ListObjectsIndexProviderState, ListPathOptions, ListPathRawOptions, ListSourceMode, ListingEntryResolution,
-        ListingSupplement, ListingSupplementOptions, MAX_OBJECT_LIST, PersistentKeyOnlyIndex, VerifiedIndexCandidateStats,
-        VersionMarker, current_list_objects_mutation_sequence, enforce_latest_listing_write_quorum,
-        expand_ask_disks_for_object_quorum, fallback_entries_for_object, gather_results, latest_listing_allow_agreed_objects,
-        latest_listing_object_quorum, latest_listing_raw_min_disks, latest_listing_required_object_quorum,
-        list_metadata_resolution_params, list_objects_from_verified_index_candidates,
-        list_objects_from_verified_index_candidates_with_optional_stats, list_objects_from_verified_index_candidates_with_stats,
-        list_objects_index_mode_from_env, list_objects_index_provider_from_env, list_objects_index_provider_state_from_env,
-        list_objects_key_only_provider_health, list_objects_quorum_from_env, list_quorum_from_env,
+        ENV_API_LIST_OBJECTS_INDEX_PROVIDER_PATH, ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_PATH, ENV_API_LIST_OBJECTS_QUORUM,
+        ENV_API_LIST_QUORUM, FallbackListingEntries, FallbackListingEntry, GatherResultsState, LIST_CURSOR_GENERATION_LIVE,
+        LIST_OBJECTS_INDEX_PROVIDER_PERSISTENT_KEY_ONLY, LIST_OBJECTS_INDEX_PROVIDER_WALKER_KEY_ONLY, ListIndexFallbackReason,
+        ListIndexLifecycle, ListIndexLifecycleState, ListIndexSourceDecision, ListMetadataAuthority, ListMetadataIndexGeneration,
+        ListMetadataIndexHealth, ListMetadataIndexKeyLookup, ListMetadataIndexPage, ListMetadataIndexPageIterator,
+        ListObjectsIndexProviderKind, ListObjectsIndexProviderState, ListPathOptions, ListPathRawOptions, ListSourceMode,
+        ListingEntryResolution, ListingSupplement, ListingSupplementOptions, MAX_OBJECT_LIST, NamespaceMutationJournalSnapshot,
+        NamespaceMutationJournalStatus, PersistentKeyOnlyIndex, VerifiedIndexCandidateStats, VersionMarker,
+        current_list_objects_mutation_sequence, enforce_latest_listing_write_quorum, expand_ask_disks_for_object_quorum,
+        fallback_entries_for_object, gather_results, latest_listing_allow_agreed_objects, latest_listing_object_quorum,
+        latest_listing_raw_min_disks, latest_listing_required_object_quorum, list_metadata_resolution_params,
+        list_objects_from_verified_index_candidates, list_objects_from_verified_index_candidates_with_optional_stats,
+        list_objects_from_verified_index_candidates_with_stats, list_objects_index_mode_from_env,
+        list_objects_index_provider_from_env, list_objects_index_provider_state_from_env, list_objects_key_only_provider_health,
+        list_objects_quorum_from_env, list_quorum_from_env, load_namespace_mutation_journal_state,
         load_persistent_key_only_index, max_keys_plus_one, merge_entry_channels, normalize_list_quorum,
-        observe_list_objects_mutation, observe_list_objects_mutations, parse_persistent_key_only_index,
-        parse_persistent_key_only_mutation_state, parse_version_marker, persistent_key_only_index_health,
-        record_list_objects_index_opt_in_fallback, reset_list_objects_mutation_sequences_for_test, resolve_agreed_listing_entry,
-        resolve_listing_entries, select_list_index_provider_source_mode, select_list_index_source_mode, send_or_cancel,
-        version_marker_for_entries, walk_result_from_set_errors, write_persistent_key_only_index,
-        write_persistent_key_only_mutation_sequence,
+        observe_list_objects_mutation, observe_list_objects_mutations, parse_namespace_mutation_journal_state,
+        parse_persistent_key_only_index, parse_version_marker, persist_observed_list_objects_mutation,
+        persistent_key_only_index_health, record_list_objects_index_opt_in_fallback,
+        reset_list_objects_mutation_sequences_for_test, resolve_agreed_listing_entry, resolve_listing_entries,
+        select_list_index_provider_source_mode, select_list_index_source_mode, send_or_cancel, version_marker_for_entries,
+        walk_result_from_set_errors, write_namespace_mutation_journal_state, write_persistent_key_only_index,
     };
     use crate::cache_value::metacache_set::{FallbackClaimTracker, TestReaderBehavior, list_path_raw};
     use crate::disk::{DiskAPI, DiskOption, endpoint::Endpoint, error::DiskError, new_disk};
@@ -6220,49 +6447,89 @@ mod test {
     }
 
     #[test]
-    fn parse_persistent_key_only_mutation_state_reads_bucket_and_high_water_mark() {
-        let state = parse_persistent_key_only_mutation_state(
-            "# rustfs-listobjects-mutation-v1\n\
+    fn parse_namespace_mutation_journal_state_reads_bucket_and_high_water_mark() {
+        let state = parse_namespace_mutation_journal_state(
+            "# rustfs-listobjects-namespace-journal-v1\n\
              # bucket=photos\n\
-             # high_water_mark=123\n",
+             # high_water_mark=123\n\
+             # status=healthy\n",
         )
-        .expect("mutation state should parse");
+        .expect("journal state should parse");
 
         assert_eq!(state.bucket.as_deref(), Some("photos"));
         assert_eq!(state.high_water_mark, 123);
+        assert_eq!(state.status, NamespaceMutationJournalStatus::Healthy);
     }
 
     #[tokio::test]
-    async fn persistent_key_only_mutation_sequence_write_never_regresses() {
+    async fn namespace_mutation_journal_write_never_regresses() {
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
-        let index_path = tempdir.path().join("persistent-key-only.index");
+        let journal_root = tempdir.path().join("namespace-mutation-journal");
 
         assert_eq!(
-            write_persistent_key_only_mutation_sequence(&index_path, "bucket", 7)
+            write_namespace_mutation_journal_state(&journal_root, "bucket", 7, false)
                 .await
-                .expect("mutation sequence should be written"),
+                .expect("journal sequence should be written")
+                .high_water_mark,
             7
         );
         assert_eq!(
-            write_persistent_key_only_mutation_sequence(&index_path, "bucket", 3)
+            write_namespace_mutation_journal_state(&journal_root, "bucket", 3, false)
                 .await
-                .expect("mutation sequence should not regress"),
+                .expect("journal sequence should not regress")
+                .high_water_mark,
             7
         );
     }
 
-    #[tokio::test]
-    async fn persistent_key_only_index_load_recovers_mutation_sequence_from_sidecar() {
+    #[test]
+    #[serial_test::serial]
+    fn observed_mutation_persists_namespace_journal_high_water() {
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
         let index_path = tempdir.path().join("persistent-key-only.index");
+        let journal_root = tempdir.path().join("namespace-mutation-journal");
+        let index_path = index_path.to_str().expect("index path should be utf8");
+        let journal_root = journal_root.to_str().expect("journal path should be utf8");
+
+        temp_env::with_var(
+            ENV_API_LIST_OBJECTS_INDEX_PROVIDER,
+            Some(LIST_OBJECTS_INDEX_PROVIDER_PERSISTENT_KEY_ONLY),
+            || {
+                temp_env::with_var(ENV_API_LIST_OBJECTS_INDEX_PROVIDER_PATH, Some(index_path), || {
+                    temp_env::with_var(ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_PATH, Some(journal_root), || {
+                        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should start");
+                        runtime.block_on(async {
+                            reset_list_objects_mutation_sequences_for_test().await;
+
+                            persist_observed_list_objects_mutation("bucket", 11).await;
+                            let state = load_namespace_mutation_journal_state(std::path::Path::new(journal_root), "bucket")
+                                .await
+                                .expect("journal state should load")
+                                .expect("journal state should exist");
+
+                            assert_eq!(state.high_water_mark, 11);
+                            assert_eq!(state.status, NamespaceMutationJournalStatus::Healthy);
+                            assert_eq!(current_list_objects_mutation_sequence("bucket").await, 11);
+                        });
+                    });
+                });
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn persistent_key_only_index_load_recovers_mutation_sequence_from_journal() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let index_path = tempdir.path().join("persistent-key-only.index");
+        let journal_root = tempdir.path().join("namespace-mutation-journal");
         let keys = vec!["object-a".to_string(), "object-b".to_string()];
 
         write_persistent_key_only_index(&index_path, "bucket", "generation-42", 5, &keys)
             .await
             .expect("index should be written");
-        write_persistent_key_only_mutation_sequence(&index_path, "bucket", 9)
+        write_namespace_mutation_journal_state(&journal_root, "bucket", 9, false)
             .await
-            .expect("sidecar mutation sequence should be written");
+            .expect("journal sequence should be written");
         reset_list_objects_mutation_sequences_for_test().await;
 
         let index = load_persistent_key_only_index(&index_path).await.expect("index should load");
@@ -6280,7 +6547,13 @@ mod test {
             keys: Arc::new(vec!["a".to_string(), "b".to_string()]),
         };
 
-        let health = persistent_key_only_index_health(&index, 42);
+        let health = persistent_key_only_index_health(
+            &index,
+            NamespaceMutationJournalSnapshot {
+                high_water_mark: 42,
+                degraded: false,
+            },
+        );
 
         assert_eq!(health.state, ListIndexLifecycleState::Healthy);
         assert_eq!(health.active_generation.as_deref(), Some("generation-42"));
@@ -6298,7 +6571,13 @@ mod test {
             keys: Arc::new(vec!["a".to_string(), "b".to_string()]),
         };
 
-        let health = persistent_key_only_index_health(&index, 43);
+        let health = persistent_key_only_index_health(
+            &index,
+            NamespaceMutationJournalSnapshot {
+                high_water_mark: 43,
+                degraded: false,
+            },
+        );
 
         assert_eq!(health.state, ListIndexLifecycleState::Lagging);
         assert_eq!(health.active_generation.as_deref(), Some("generation-42"));
@@ -6306,6 +6585,27 @@ mod test {
         assert_eq!(health.mutation_high_water_mark, 43);
         assert_eq!(health.mutation_lag, 1);
         assert_eq!(health.fallback_reason, Some(ListIndexFallbackReason::Lagging));
+    }
+
+    #[test]
+    fn persistent_key_only_index_health_reports_degraded_journal() {
+        let index = PersistentKeyOnlyIndex {
+            bucket: Some("bucket".to_string()),
+            generation: "generation-42".to_string(),
+            checkpoint_high_water_mark: 42,
+            keys: Arc::new(vec!["a".to_string(), "b".to_string()]),
+        };
+
+        let health = persistent_key_only_index_health(
+            &index,
+            NamespaceMutationJournalSnapshot {
+                high_water_mark: 42,
+                degraded: true,
+            },
+        );
+
+        assert_eq!(health.state, ListIndexLifecycleState::Degraded);
+        assert_eq!(health.fallback_reason, Some(ListIndexFallbackReason::Degraded));
     }
 
     #[tokio::test]
