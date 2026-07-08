@@ -208,6 +208,12 @@ impl Sets {
         self.set_drive_count
     }
 
+    /// This pool's per-instance runtime context (Phase 5, backlog#939).
+    #[allow(dead_code)] // Consumed starting Slice 3 (lock-namespace isolation).
+    pub(crate) fn instance_ctx(&self) -> &Arc<InstanceContext> {
+        &self.ctx
+    }
+
     pub async fn monitor_and_connect_endpoints(&self, mut rx: Receiver<()>) {
         tokio::time::sleep(Duration::from_secs(5)).await;
 

@@ -188,13 +188,13 @@ pub struct ECStore {
     /// The saver then clones the latest `pool_meta` under a short read lock and
     /// releases it before awaiting disk writes.
     pub(crate) pool_meta_save_gate: Mutex<()>,
-    /// Per-instance runtime-identity context (issue #939, Slice1).
+    /// Per-instance runtime state (Phase 5, backlog#939).
     ///
-    /// Carries the runtime state that distinguishes this instance from another
-    /// (currently the erasure setup type). Method bodies read `self.ctx` and
-    /// spawned children inherit it through the moved object graph. Production
-    /// construction *adopts* the process `bootstrap_ctx()` so the startup-time
-    /// write and post-construction read share one cell.
+    /// Carries this instance's identity/runtime out of the process globals so
+    /// multiple instances can coexist without cross-contamination. `new`
+    /// adopts the process bootstrap context (never mints a fresh one) so that
+    /// startup writes and post-construction reads share one cell — single
+    /// instance behavior is unchanged.
     pub(crate) ctx: Arc<InstanceContext>,
 }
 
@@ -274,32 +274,6 @@ impl ECStore {
     }
 }
 
-/// Phase 5 (#939): instance-scoped setup-type predicates.
-///
-/// These read `self.ctx` directly instead of the process facade, so they report
-/// *this* instance's setup type — the isolation seam that lets two ECStores
-/// coexist without the erasure booleans of one leaking into the other. Slice1
-/// exercises them from tests; the data-path call sites move onto `self.ctx` in
-/// Slice2, so the seam is intentionally established ahead of its production
-/// callers.
-#[allow(dead_code)] // #939 Slice1: consumed by tests now, by the data path in Slice2.
-impl ECStore {
-    /// True when this instance is erasure-coded (`Erasure` or `DistErasure`).
-    pub(crate) async fn setup_is_erasure(&self) -> bool {
-        self.ctx.is_erasure().await
-    }
-
-    /// True only when this instance is distributed erasure.
-    pub(crate) async fn setup_is_dist_erasure(&self) -> bool {
-        self.ctx.is_dist_erasure().await
-    }
-
-    /// True only when this instance is single-drive erasure.
-    pub(crate) async fn setup_is_erasure_sd(&self) -> bool {
-        self.ctx.is_erasure_sd().await
-    }
-}
-
 /// Phase 4: Server address accessors
 /// These provide a unified API through ECStore for accessing server-level
 /// configuration globals. The globals remain the source of truth.
@@ -317,6 +291,29 @@ impl ECStore {
     /// Get the server address (host:port)
     pub async fn addr(&self) -> String {
         runtime_sources::rustfs_addr().await
+    }
+}
+
+/// Phase 5: Per-instance erasure setup accessors (backlog#939)
+///
+/// These read this instance's own [`InstanceContext`] rather than a process
+/// global, so two instances carrying different contexts stay isolated. The
+/// legacy free-function facade (`runtime::global::is_erasure` etc.) forwards to
+/// the current instance's context, preserving single-instance behavior.
+impl ECStore {
+    /// Whether this instance uses erasure coding (single-node or distributed).
+    pub async fn setup_is_erasure(&self) -> bool {
+        self.ctx.is_erasure().await
+    }
+
+    /// Whether this instance uses distributed erasure coding.
+    pub async fn setup_is_dist_erasure(&self) -> bool {
+        self.ctx.is_dist_erasure().await
+    }
+
+    /// Whether this instance uses single-drive erasure coding.
+    pub async fn setup_is_erasure_sd(&self) -> bool {
+        self.ctx.is_erasure_sd().await
     }
 }
 
@@ -818,7 +815,7 @@ impl crate::storage_api_contracts::admin::StorageAdminApi for ECStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::layout::endpoints::{Endpoints, PoolEndpoints};
+    use crate::layout::endpoints::{Endpoints, PoolEndpoints, SetupType};
     use crate::runtime::global::reset_local_disk_test_state;
     use crate::runtime::sources::{clear_local_disk_id_map_for_test, local_disk_path_by_id};
     use crate::store::init_format::{connect_load_init_formats, init_disks};
@@ -833,6 +830,60 @@ mod tests {
         assert_eq!(infos.len(), disks.len());
         // All should be None since we passed None disks
         assert!(infos.iter().all(|info| info.is_none()));
+    }
+
+    // Build a minimal ECStore carrying an explicit instance context. Empty
+    // pools/disks are sufficient: the Phase 5 accessors read only `self.ctx`.
+    fn build_store_with_ctx(ctx: Arc<InstanceContext>) -> ECStore {
+        let endpoint_pools = EndpointServerPools::default();
+        ECStore {
+            id: uuid::Uuid::new_v4(),
+            disk_map: std::collections::HashMap::new(),
+            pools: Vec::new(),
+            peer_sys: crate::cluster::rpc::S3PeerSys::new(&endpoint_pools),
+            pool_meta: RwLock::new(PoolMeta::default()),
+            rebalance_meta: RwLock::new(None),
+            decommission_cancelers: RwLock::new(Vec::new()),
+            start_gate: Mutex::new(()),
+            pool_meta_save_gate: Mutex::new(()),
+            ctx,
+        }
+    }
+
+    // The object graph is the isolation carrier: two ECStore instances holding
+    // distinct contexts report independent erasure state through their real
+    // `&self` accessors — no cross-contamination.
+    #[tokio::test]
+    async fn instance_context_carrier_isolates_two_stores() {
+        let ctx_a = Arc::new(InstanceContext::new());
+        let ctx_b = Arc::new(InstanceContext::new());
+        ctx_a.update_erasure_type(SetupType::DistErasure).await;
+        ctx_b.update_erasure_type(SetupType::ErasureSD).await;
+
+        let store_a = build_store_with_ctx(ctx_a);
+        let store_b = build_store_with_ctx(ctx_b);
+
+        // store_a: distributed erasure (implies is_erasure), not single-drive.
+        assert!(store_a.setup_is_erasure().await);
+        assert!(store_a.setup_is_dist_erasure().await);
+        assert!(!store_a.setup_is_erasure_sd().await);
+
+        // store_b: single-drive erasure only.
+        assert!(store_b.setup_is_erasure_sd().await);
+        assert!(!store_b.setup_is_erasure().await);
+        assert!(!store_b.setup_is_dist_erasure().await);
+    }
+
+    // The production/test constructors ADOPT the process bootstrap context
+    // (same Arc), so a startup write recorded before the store existed is
+    // visible through the store afterward — single-instance behavior preserved.
+    #[tokio::test]
+    async fn store_adopts_bootstrap_context() {
+        let store = build_store_with_ctx(crate::runtime::instance::bootstrap_ctx());
+        assert!(
+            Arc::ptr_eq(&store.ctx, &crate::runtime::instance::bootstrap_ctx()),
+            "store built via adoption must share the bootstrap context Arc"
+        );
     }
 
     #[tokio::test]

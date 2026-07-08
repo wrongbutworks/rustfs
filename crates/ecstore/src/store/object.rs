@@ -356,6 +356,27 @@ fn resolve_data_movement_tiered_resume_result(
     Ok(is_equivalent_data_movement_tiered_object(source, &target))
 }
 
+fn return_batch_delete_lock_error(objects: &[ObjectToDelete], err: Error) -> (Vec<DeletedObject>, Vec<Option<Error>>) {
+    let del_objects = objects
+        .iter()
+        .map(|object| DeletedObject {
+            object_name: decode_dir_object(&object.object_name),
+            version_id: object.version_id,
+            ..Default::default()
+        })
+        .collect();
+    let del_errs = objects.iter().map(|_| Some(err.clone())).collect();
+
+    (del_objects, del_errs)
+}
+
+fn sorted_unique_delete_object_names(objects: &[ObjectToDelete]) -> Vec<&str> {
+    let mut object_names: Vec<&str> = objects.iter().map(|object| object.object_name.as_str()).collect();
+    object_names.sort_unstable();
+    object_names.dedup();
+    object_names
+}
+
 impl ECStore {
     fn map_namespace_lock_error(bucket: &str, object: &str, mode: &'static str, err: rustfs_lock::LockError) -> StorageError {
         match err {
@@ -370,17 +391,7 @@ impl ECStore {
         }
     }
 
-    async fn acquire_object_write_lock_if_needed(
-        &self,
-        op: &'static str,
-        bucket: &str,
-        object: &str,
-        opts: &mut ObjectOptions,
-    ) -> Result<Option<ObjectLockDiagGuard>> {
-        if opts.no_lock {
-            return Ok(None);
-        }
-
+    async fn acquire_object_write_lock(&self, op: &'static str, bucket: &str, object: &str) -> Result<ObjectLockDiagGuard> {
         let diag_enabled = is_object_lock_diag_enabled();
         let ns_lock = self.handle_new_ns_lock(bucket, object).await?;
         let acquire_start = Instant::now();
@@ -398,9 +409,8 @@ impl ECStore {
             acquire_start.elapsed(),
             diag_enabled,
         );
-        opts.no_lock = true;
 
-        Ok(Some(ObjectLockDiagGuard::new(
+        Ok(ObjectLockDiagGuard::new(
             guard,
             diag_enabled,
             op,
@@ -408,7 +418,46 @@ impl ECStore {
             diag_enabled.then(|| object.to_string()),
             owner,
             ObjectLockDiagMode::Write,
-        )))
+        ))
+    }
+
+    async fn acquire_object_write_lock_if_needed(
+        &self,
+        op: &'static str,
+        bucket: &str,
+        object: &str,
+        opts: &mut ObjectOptions,
+    ) -> Result<Option<ObjectLockDiagGuard>> {
+        if opts.no_lock {
+            return Ok(None);
+        }
+
+        let guard = self.acquire_object_write_lock(op, bucket, object).await?;
+        opts.no_lock = true;
+
+        Ok(Some(guard))
+    }
+
+    async fn acquire_delete_objects_write_locks(
+        &self,
+        bucket: &str,
+        objects: &[ObjectToDelete],
+        opts: &mut ObjectOptions,
+    ) -> Result<Vec<ObjectLockDiagGuard>> {
+        if opts.no_lock || objects.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let object_names = sorted_unique_delete_object_names(objects);
+        // Lock order: encoded object names are acquired in ascending order, then
+        // the set-layer calls receive no_lock so they do not reacquire them.
+        let mut guards = Vec::with_capacity(object_names.len());
+        for object in object_names {
+            guards.push(self.acquire_object_write_lock("delete_objects", bucket, object).await?);
+        }
+        opts.no_lock = true;
+
+        Ok(guards)
     }
 
     async fn acquire_object_read_lock_if_needed(
@@ -1048,7 +1097,11 @@ impl ECStore {
             del_errs.push(None)
         }
 
-        // TODO: nslock
+        let mut opts = opts;
+        let _object_lock_guards = match self.acquire_delete_objects_write_locks(bucket, &objects, &mut opts).await {
+            Ok(guards) => guards,
+            Err(err) => return return_batch_delete_lock_error(objects.as_slice(), err),
+        };
 
         let mut futures = Vec::with_capacity(self.pools.len());
 
@@ -1938,14 +1991,27 @@ mod tests {
         assert!(lookup_opts.no_lock);
     }
 
-    async fn new_read_lock_test_store() -> ECStore {
-        new_test_store_with_ctx(crate::runtime::instance::bootstrap_ctx()).await
+    #[test]
+    fn delete_objects_lock_names_are_sorted_and_unique() {
+        let objects = vec![
+            ObjectToDelete {
+                object_name: "beta".to_string(),
+                ..Default::default()
+            },
+            ObjectToDelete {
+                object_name: "alpha".to_string(),
+                ..Default::default()
+            },
+            ObjectToDelete {
+                object_name: "beta".to_string(),
+                ..Default::default()
+            },
+        ];
+
+        assert_eq!(sorted_unique_delete_object_names(&objects), vec!["alpha", "beta"]);
     }
 
-    /// Build a minimal in-memory ECStore carrying a caller-supplied runtime
-    /// context. Used by the #939 isolation test to give two stores *distinct*
-    /// `ctx` so their setup-type state cannot bleed across.
-    async fn new_test_store_with_ctx(ctx: std::sync::Arc<crate::runtime::instance::InstanceContext>) -> ECStore {
+    async fn new_read_lock_test_store() -> ECStore {
         let format = FormatV3::new(1, 2);
         let endpoints = vec![
             Endpoint::try_from("http://127.0.0.1:9000/data0").expect("first endpoint should parse"),
@@ -1960,7 +2026,7 @@ mod tests {
             platform: "test".to_string(),
         };
         let endpoint_pools = EndpointServerPools::from(vec![pool_endpoints.clone()]);
-        let sets = Sets::new(vec![None, None], &pool_endpoints, &format, 0, 1, ctx.clone())
+        let sets = Sets::new(vec![None, None], &pool_endpoints, &format, 0, 1, crate::runtime::instance::bootstrap_ctx())
             .await
             .expect("test sets should be created with empty disks");
 
@@ -1974,73 +2040,92 @@ mod tests {
             decommission_cancelers: RwLock::new(Vec::new()),
             start_gate: Mutex::new(()),
             pool_meta_save_gate: Mutex::new(()),
-            ctx,
+            ctx: crate::runtime::instance::bootstrap_ctx(),
         }
     }
 
-    /// The bootstrap-adopting constructor path (production `ECStore::new` and the
-    /// default test helper) must land on the *same* `Arc` the startup writes went
-    /// to, or single-instance reads would see stale state.
+    // Phase 5 Slice 2 (backlog#939): the instance context flows down the whole
+    // object graph — ECStore, its Sets, and their SetDisks must all carry the
+    // same `Arc<InstanceContext>` in a single-instance deployment.
     #[tokio::test]
-    async fn store_adopts_bootstrap_context() {
+    async fn instance_context_flows_through_object_graph() {
         let store = new_read_lock_test_store().await;
+
+        let sets = store.pools.first().expect("test store has one pool");
         assert!(
-            std::sync::Arc::ptr_eq(&store.ctx, &crate::runtime::instance::bootstrap_ctx()),
-            "default-constructed store must adopt the process bootstrap context"
+            std::sync::Arc::ptr_eq(&store.ctx, sets.instance_ctx()),
+            "Sets must carry the store's instance context"
+        );
+
+        let set_disks = sets.disk_set.first().expect("pool has one set");
+        assert!(
+            std::sync::Arc::ptr_eq(sets.instance_ctx(), set_disks.instance_ctx()),
+            "SetDisks must carry the Sets' instance context"
         );
     }
 
-    /// End-to-end (non-strawman) isolation proof: two real ECStores, each with a
-    /// distinct `ctx`, read their setup type through the real `&self` predicate
-    /// methods. One is DistErasure, the other ErasureSD; neither sees the other's
-    /// state — the guarantee #3243 lacked.
+    // Phase 5 Slice 3 (backlog#939): a SetDisks sources its lock manager from
+    // its instance context (not an independent process lookup), and in a
+    // single-instance build that context aliases the process lock-manager
+    // singleton — so the lock namespace is unchanged.
     #[tokio::test]
-    async fn instance_context_carrier_isolates_two_stores() {
-        use crate::layout::endpoints::SetupType;
-        use crate::runtime::instance::InstanceContext;
+    async fn set_disks_lock_manager_comes_from_instance_context() {
+        let store = new_read_lock_test_store().await;
+        let set_disks = store.pools[0].disk_set.first().expect("pool has one set");
 
-        let ctx_a = std::sync::Arc::new(InstanceContext::new());
-        let ctx_b = std::sync::Arc::new(InstanceContext::new());
-        ctx_a.set_erasure_kind(SetupType::DistErasure).await;
-        ctx_b.set_erasure_kind(SetupType::ErasureSD).await;
-
-        let store_a = new_test_store_with_ctx(ctx_a).await;
-        let store_b = new_test_store_with_ctx(ctx_b).await;
-
-        assert!(store_a.setup_is_dist_erasure().await);
-        assert!(store_a.setup_is_erasure().await); // DistErasure ⇒ is_erasure
-        assert!(!store_a.setup_is_erasure_sd().await);
-
-        assert!(store_b.setup_is_erasure_sd().await);
-        assert!(!store_b.setup_is_dist_erasure().await);
-        assert!(!store_b.setup_is_erasure().await);
+        assert!(
+            std::sync::Arc::ptr_eq(set_disks.local_lock_manager_for_test(), &set_disks.instance_ctx().lock_manager()),
+            "SetDisks lock manager must be sourced from its instance context"
+        );
+        assert!(
+            std::sync::Arc::ptr_eq(set_disks.local_lock_manager_for_test(), &rustfs_lock::get_global_lock_manager()),
+            "single-instance lock manager must alias the process singleton"
+        );
     }
 
-    /// #939 Slice2: the instance context threads *identically* down the whole
-    /// pool graph — `ECStore.ctx`, every `Sets.ctx`, and every `SetDisks.ctx`
-    /// are the same `Arc`. The set layer therefore reads this instance's setup
-    /// type (`self.ctx`) rather than the process facade.
     #[tokio::test]
-    async fn ctx_threads_through_pool_graph() {
-        use crate::layout::endpoints::SetupType;
-        use crate::runtime::instance::InstanceContext;
+    #[serial_test::serial]
+    async fn delete_objects_write_locks_cover_each_unique_object() {
+        let store = new_read_lock_test_store().await;
+        let objects = vec![
+            ObjectToDelete {
+                object_name: "beta".to_string(),
+                ..Default::default()
+            },
+            ObjectToDelete {
+                object_name: "alpha".to_string(),
+                ..Default::default()
+            },
+            ObjectToDelete {
+                object_name: "beta".to_string(),
+                ..Default::default()
+            },
+        ];
+        let mut opts = ObjectOptions::default();
 
-        let ctx = std::sync::Arc::new(InstanceContext::new());
-        ctx.set_erasure_kind(SetupType::DistErasure).await;
+        let guards = store
+            .acquire_delete_objects_write_locks("bucket", &objects, &mut opts)
+            .await
+            .expect("delete object locks should be acquired");
 
-        let store = new_test_store_with_ctx(ctx.clone()).await;
-        assert!(std::sync::Arc::ptr_eq(&store.ctx, &ctx), "store must hold the passed ctx");
+        assert_eq!(guards.len(), 2, "duplicate object names should share one namespace lock");
+        assert!(opts.no_lock, "set layer should not reacquire locks already held by ECStore");
 
-        assert!(!store.pools.is_empty(), "test store should have one pool");
-        for sets in &store.pools {
-            assert!(std::sync::Arc::ptr_eq(&sets.ctx, &ctx), "Sets must share the store ctx");
-            assert!(!sets.disk_set.is_empty(), "pool should have one set");
-            for set_disks in &sets.disk_set {
-                assert!(std::sync::Arc::ptr_eq(&set_disks.ctx, &ctx), "SetDisks must share the store ctx");
-                // set-layer predicate reads self.ctx, so it sees DistErasure
-                assert!(set_disks.ctx.is_dist_erasure().await);
-            }
-        }
+        let alpha_lock = store
+            .handle_new_ns_lock("bucket", "alpha")
+            .await
+            .expect("alpha namespace lock should be created");
+        let err = alpha_lock
+            .get_read_lock(Duration::from_millis(20))
+            .await
+            .expect_err("batch delete write guard should block alpha readers");
+        assert!(matches!(err, rustfs_lock::LockError::Timeout { .. }));
+
+        drop(guards);
+        alpha_lock
+            .get_read_lock(Duration::from_secs(1))
+            .await
+            .expect("alpha read lock should be available after dropping batch guards");
     }
 
     #[tokio::test]

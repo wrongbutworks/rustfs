@@ -12,12 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::instance::{InstanceContext, bootstrap_ctx};
 use crate::bucket::bandwidth::monitor::Monitor;
 use crate::{
     bucket::lifecycle::bucket_lifecycle_ops::LifecycleSys,
     disk::DiskStore,
     layout::endpoints::{EndpointServerPools, PoolEndpoints, SetupType},
-    runtime::instance::{InstanceContext, bootstrap_ctx},
     services::event_notification::EventNotifier,
     services::tier::tier::TierConfigMgr,
     store::ECStore,
@@ -43,16 +43,17 @@ pub const DISK_RESERVE_FRACTION: f64 = 0.15;
 // These should be migrated to AppContext over time.
 // See issue #730 for migration plan.
 //
-// Tier A (needs migration): GLOBAL_OBJECT_API, GLOBAL_IS_ERASURE*, GLOBAL_LOCAL_DISK_*,
+// Tier A (needs migration): GLOBAL_OBJECT_API, GLOBAL_LOCAL_DISK_*,
 //   GLOBAL_ROOT_DISK_THRESHOLD, GLOBAL_LIFECYCLE_SYS, GLOBAL_EVENT_NOTIFIER, etc.
 // Tier B (keep as static): GLOBAL_RUSTFS_PORT, GLOBAL_REGION, env var caches, etc.
+//
+// Phase 5 (backlog#939): the erasure setup type moved into the per-instance
+// `InstanceContext` (see `super::instance`); the erasure predicates below now
+// forward to the current instance's context.
 lazy_static! {
     static ref GLOBAL_RUSTFS_PORT: OnceLock<u16> = OnceLock::new();
     static ref GLOBAL_DEPLOYMENT_ID: OnceLock<Uuid> = OnceLock::new();
     pub static ref GLOBAL_OBJECT_API: OnceLock<Arc<ECStore>> = OnceLock::new();
-    // GLOBAL_IS_ERASURE / GLOBAL_IS_DIST_ERASURE / GLOBAL_IS_ERASURE_SD were three
-    // independent `RwLock<bool>` truth sources. Issue #939 Slice1 collapsed them into
-    // a single `InstanceContext.erasure_kind`; the accessors below now forward there.
     pub static ref GLOBAL_LOCAL_DISK_MAP: Arc<RwLock<HashMap<String, Option<DiskStore>>>> = Arc::new(RwLock::new(HashMap::new()));
     pub static ref GLOBAL_LOCAL_DISK_ID_MAP: Arc<RwLock<HashMap<Uuid, String>>> = Arc::new(RwLock::new(HashMap::new()));
     pub static ref GLOBAL_LOCAL_DISK_SET_DRIVES: Arc<RwLock<TypeLocalDiskSetDrives>> = Arc::new(RwLock::new(Vec::new()));
@@ -208,6 +209,19 @@ pub fn resolve_object_store_handle() -> Option<Arc<ECStore>> {
         .or_else(new_object_layer_fn)
 }
 
+/// Resolve the instance context for the legacy free-function facade.
+///
+/// Prefers the currently-published `ECStore`'s own context; before any store
+/// is published (e.g. during storage startup, or in unit tests) it falls back
+/// to the process-level [`bootstrap_ctx`]. Because `ECStore::new` adopts the
+/// bootstrap `Arc`, single-instance callers always observe one and the same
+/// context — behavior is unchanged from the previous process-global bools.
+pub(crate) fn current_ctx() -> Arc<InstanceContext> {
+    resolve_object_store_handle()
+        .map(|store| store.ctx.clone())
+        .unwrap_or_else(bootstrap_ctx)
+}
+
 /// Set the global object layer
 ///
 /// # Arguments
@@ -256,25 +270,7 @@ pub async fn is_erasure() -> bool {
 /// # Returns
 /// * None
 pub async fn update_erasure_type(setup_type: SetupType) {
-    current_ctx().set_erasure_kind(setup_type).await;
-}
-
-/// Resolve the runtime-identity context the legacy free-function facade should
-/// act on.
-///
-/// This is the honest single-instance default: once the process object layer is
-/// published it forwards to the live store's `ctx`; before then it forwards to
-/// the process [`bootstrap_ctx`]. Because `ECStore::new` *adopts* the same
-/// bootstrap `Arc`, the startup write and the post-construction read hit one
-/// cell — single-instance behavior is unchanged. It does not (and cannot)
-/// disambiguate between multiple concurrent instances from a free function; per
-/// #939 that isolation is delivered by callers reaching `self.ctx` on the object
-/// graph, not through this facade.
-pub(crate) fn current_ctx() -> Arc<InstanceContext> {
-    match GLOBAL_OBJECT_API.get() {
-        Some(store) => store.ctx.clone(),
-        None => bootstrap_ctx(),
-    }
+    current_ctx().update_erasure_type(setup_type).await;
 }
 
 // pub fn is_legacy() -> bool {

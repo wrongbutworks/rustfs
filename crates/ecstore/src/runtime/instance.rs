@@ -12,104 +12,110 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Per-instance runtime identity context (issue #939, Phase 5 — Slice1).
+//! Per-instance runtime state ("instance context").
 //!
-//! Phase 1–4 (#653) unified *access* to ECStore's runtime globals behind
-//! accessor APIs but kept the underlying `OnceLock`/`RwLock` statics
-//! process-global — deleting the single-instance guard (#3243) would not
-//! isolate anything, since two `RustFSServer`s still share one
-//! `GLOBAL_OBJECT_API`. This type is the isolation carrier those slices
-//! deferred.
+//! Phase 5 of the global-singleton consolidation (backlog#939). State that
+//! carries an `ECStore` instance's identity/runtime is being moved out of the
+//! process-level statics in [`super::global`] into this context so that
+//! multiple `ECStore` instances can coexist in one process without
+//! cross-contaminating each other's state.
 //!
-//! The isolation vehicle is **the object graph**, not `tokio::task_local`:
-//! `task_local` does not propagate across `tokio::spawn`, and ecstore has
-//! 155+ internal spawns whose closures already `move` the object `Arc`s.
-//! Each [`crate::store::ECStore`] holds an `Arc<InstanceContext>`, so method
-//! bodies read `self.ctx` and reach every spawned child without threading a
-//! `&ctx` argument through call sites.
+//! ## Isolation carrier
 //!
-//! Slice1 migrates one representative group — the erasure setup type, formerly
-//! three independent `RwLock<bool>` statics (`GLOBAL_IS_ERASURE`,
-//! `GLOBAL_IS_DIST_ERASURE`, `GLOBAL_IS_ERASURE_SD`) — into a single
-//! `RwLock<SetupType>` whose booleans are *derived*. Those three booleans were
-//! three separate mutable truth sources kept consistent only by the implicit
-//! derivation inside `update_erasure_type`; collapsing them removes the torn
-//! intermediate states that design allowed.
+//! Multi-instance disambiguation is carried by the **object graph**
+//! (`ECStore` → `Vec<Arc<Sets>>` → `SetDisks`), each holding an
+//! `Arc<InstanceContext>`. Instance-scoped reads resolve through `self.ctx`,
+//! so no call-site signatures change. (A `task_local` was rejected during
+//! design review: it does not propagate across the many internal
+//! `tokio::spawn` boundaries in the data/background paths.)
+//!
+//! ## Backward compatibility
+//!
+//! The legacy free-function facade in [`super::global`]
+//! (`is_erasure`/`update_erasure_type`/…) resolves the *current* instance via
+//! the object-store resolver and falls back to the process-level
+//! [`bootstrap_ctx`] when no store is published yet. Because `ECStore::new`
+//! **adopts** the same bootstrap `Arc` (rather than minting a fresh one),
+//! startup writes and post-construction reads hit the same cell and
+//! single-instance behavior is byte-for-byte unchanged.
 
 use crate::layout::endpoints::SetupType;
+use rustfs_lock::{GlobalLockManager, get_global_lock_manager};
 use std::sync::{Arc, OnceLock};
 use tokio::sync::RwLock;
 
-/// Runtime-identity state that distinguishes one ECStore instance from another.
+/// Runtime state owned by a single `ECStore` instance.
 ///
-/// Slice1 carries only the erasure setup type. Later slices fold in the
-/// remaining Tier A runtime-identity globals (topology scalars, disk registry,
-/// service handles, background-task lifetime) as separate fields.
+/// This is intentionally minimal in the first migration slice; subsequent
+/// slices move additional identity/runtime state (topology, disk registry,
+/// service handles, cancellation token) into this struct.
 #[derive(Debug)]
-pub(crate) struct InstanceContext {
-    /// Single source of truth for the deployment's setup type. The legacy
-    /// `is_erasure`/`is_dist_erasure`/`is_erasure_sd` booleans are derived from
-    /// this value rather than stored independently.
+pub struct InstanceContext {
+    /// The deployment's erasure setup type.
+    ///
+    /// Single source of truth for the derived `is_erasure` /
+    /// `is_dist_erasure` / `is_erasure_sd` predicates, replacing the three
+    /// previously-independent process-global erasure-mode bools (which could
+    /// drift out of sync). Stored as one value so the three predicates can
+    /// never observe a torn intermediate state.
     erasure_kind: RwLock<SetupType>,
-    /// Per-instance local lock manager (issue #939, Slice3). `SetDisks` reads
-    /// this off `self.ctx` so two ECStore instances get *separate* lock
-    /// namespaces instead of colliding on one process-global manager. The
-    /// bootstrap context deliberately holds the process-global manager (see
-    /// [`bootstrap_ctx`]) so single-instance locking is byte-for-byte unchanged.
-    local_lock_manager: Arc<rustfs_lock::GlobalLockManager>,
+    /// This instance's namespace lock manager (Phase 5 Slice 3, backlog#939).
+    ///
+    /// Owned per-instance so two instances no longer share a lock namespace
+    /// (which would make same-named objects in different instances falsely
+    /// contend). Single-instance aliases the process singleton, so behavior is
+    /// unchanged; see [`bootstrap_ctx`].
+    lock_manager: Arc<GlobalLockManager>,
 }
 
 impl InstanceContext {
-    /// Fresh context in the pre-startup default state — equivalent to the old
-    /// three booleans all initialized to `false` (`SetupType::Unknown`).
-    ///
-    /// Mints its **own** lock manager, so a context built this way is fully
-    /// isolated from the process-global one. Production goes through
-    /// [`bootstrap_ctx`], which adopts the global manager instead.
-    pub(crate) fn new() -> Self {
-        Self::with_lock_manager(Arc::new(rustfs_lock::GlobalLockManager::new()))
+    /// Create a fresh instance context in the initial [`SetupType::Unknown`]
+    /// state with its own lock manager — byte-for-byte equivalent to the old
+    /// all-`false` erasure globals.
+    pub fn new() -> Self {
+        Self::with_lock_manager(Arc::new(GlobalLockManager::new()))
     }
 
-    /// Build a context around a specific lock manager. Lets [`bootstrap_ctx`]
-    /// adopt the process-global manager while [`new`](Self::new) mints an
-    /// isolated one.
-    fn with_lock_manager(local_lock_manager: Arc<rustfs_lock::GlobalLockManager>) -> Self {
+    /// Build a context bound to a specific lock manager.
+    ///
+    /// [`bootstrap_ctx`] uses this to alias the process-global lock manager so
+    /// single-instance deployments keep one shared namespace; `new` mints a
+    /// fresh manager for a genuinely independent instance.
+    fn with_lock_manager(lock_manager: Arc<GlobalLockManager>) -> Self {
         Self {
             erasure_kind: RwLock::new(SetupType::Unknown),
-            local_lock_manager,
+            lock_manager,
         }
     }
 
-    /// This instance's local lock manager. `SetDisks::new` stores the result so
-    /// the set layer locks within this instance's namespace.
-    pub(crate) fn local_lock_manager(&self) -> Arc<rustfs_lock::GlobalLockManager> {
-        self.local_lock_manager.clone()
+    /// This instance's namespace lock manager.
+    pub fn lock_manager(&self) -> Arc<GlobalLockManager> {
+        self.lock_manager.clone()
     }
 
-    /// True when the deployment is erasure-coded — single-node multi-drive
-    /// (`Erasure`) *or* distributed (`DistErasure`).
+    /// Update this instance's erasure setup type.
+    pub async fn update_erasure_type(&self, setup_type: SetupType) {
+        *self.erasure_kind.write().await = setup_type;
+    }
+
+    /// Whether this instance uses erasure coding.
     ///
-    /// Mirrors the legacy derivation exactly: `update_erasure_type` set
-    /// `is_erasure = true` whenever the type was `DistErasure`, so both variants
-    /// report `true` here.
-    pub(crate) async fn is_erasure(&self) -> bool {
+    /// True for both single-node ([`SetupType::Erasure`]) and distributed
+    /// ([`SetupType::DistErasure`]) erasure setups, matching the original
+    /// `update_erasure_type` derivation where `DistErasure` implied
+    /// `is_erasure == true`.
+    pub async fn is_erasure(&self) -> bool {
         matches!(*self.erasure_kind.read().await, SetupType::Erasure | SetupType::DistErasure)
     }
 
-    /// True only for the distributed erasure setup type.
-    pub(crate) async fn is_dist_erasure(&self) -> bool {
+    /// Whether this instance uses distributed erasure coding.
+    pub async fn is_dist_erasure(&self) -> bool {
         *self.erasure_kind.read().await == SetupType::DistErasure
     }
 
-    /// True only for the single-drive erasure setup type.
-    pub(crate) async fn is_erasure_sd(&self) -> bool {
+    /// Whether this instance uses single-drive erasure coding.
+    pub async fn is_erasure_sd(&self) -> bool {
         *self.erasure_kind.read().await == SetupType::ErasureSD
-    }
-
-    /// Replace the setup type. Single write path: the three derived booleans can
-    /// never disagree, unlike the former three-lock `update_erasure_type`.
-    pub(crate) async fn set_erasure_kind(&self, setup_type: SetupType) {
-        *self.erasure_kind.write().await = setup_type;
     }
 }
 
@@ -119,66 +125,55 @@ impl Default for InstanceContext {
     }
 }
 
-/// Process-wide bootstrap context.
+/// Process-level bootstrap instance context.
 ///
-/// During startup, erasure/disk-table state is published *before* any
-/// `ECStore` exists. To keep the startup write and the post-construction read
-/// hitting the *same* cell, `ECStore::new` adopts this exact `Arc` instead of
-/// minting a fresh context. Single-instance semantics are therefore
-/// byte-for-byte unchanged: the compatibility facade (`is_erasure()` &c.)
-/// resolves to the live store's `ctx` once it exists, and to this bootstrap
-/// context before then — the same underlying `InstanceContext`.
+/// Storage startup writes erasure state before any `ECStore` exists (see
+/// `init_startup_storage_foundation`), so the context must exist ahead of the
+/// object graph. `ECStore::new` adopts this same `Arc` via [`bootstrap_ctx`],
+/// guaranteeing that startup writes and post-construction reads share one cell.
 static BOOTSTRAP_CTX: OnceLock<Arc<InstanceContext>> = OnceLock::new();
 
-/// Get (initializing on first call) the process bootstrap context.
+/// Return the process-level bootstrap instance context, creating it on first
+/// access.
 ///
-/// Adopts the process-global lock manager (`rustfs_lock::get_global_lock_manager`)
-/// rather than minting a fresh one, so `SetDisks` built for the single process
-/// instance lock in exactly the same namespace as every other direct caller of
-/// `get_global_lock_manager()` — byte-for-byte unchanged locking behavior.
-pub(crate) fn bootstrap_ctx() -> Arc<InstanceContext> {
+/// This is the single-instance default that the legacy free-function facade
+/// falls back to before an `ECStore` is published, and the `Arc` that
+/// `ECStore::new` adopts as its own `ctx`.
+pub fn bootstrap_ctx() -> Arc<InstanceContext> {
     BOOTSTRAP_CTX
-        .get_or_init(|| Arc::new(InstanceContext::with_lock_manager(rustfs_lock::get_global_lock_manager())))
+        .get_or_init(|| Arc::new(InstanceContext::with_lock_manager(get_global_lock_manager())))
         .clone()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::layout::endpoints::SetupType;
 
-    /// Legacy `update_erasure_type` derivation, replayed field-by-field, so the
-    /// context predicates can be checked byte-for-byte against the old three
-    /// booleans for every setup type.
-    fn legacy_booleans(setup_type: &SetupType) -> (bool, bool, bool) {
-        let mut is_erasure = *setup_type == SetupType::Erasure;
-        let is_dist_erasure = *setup_type == SetupType::DistErasure;
-        if is_dist_erasure {
-            is_erasure = true;
-        }
-        let is_erasure_sd = *setup_type == SetupType::ErasureSD;
-        (is_erasure, is_dist_erasure, is_erasure_sd)
-    }
-
+    // The SetupType inputs must derive the exact (is_erasure,
+    // is_dist_erasure, is_erasure_sd) triples that the original three
+    // process-global erasure bools produced via update_erasure_type().
     #[tokio::test]
     async fn erasure_predicates_match_legacy_derivation() {
-        for setup_type in [
-            SetupType::Unknown,
-            SetupType::FS,
-            SetupType::ErasureSD,
-            SetupType::Erasure,
-            SetupType::DistErasure,
-        ] {
-            let ctx = InstanceContext::new();
-            ctx.set_erasure_kind(setup_type.clone()).await;
+        let cases = [
+            // (input, is_erasure, is_dist_erasure, is_erasure_sd)
+            (SetupType::Unknown, false, false, false),
+            (SetupType::FS, false, false, false),
+            (SetupType::Erasure, true, false, false),
+            // DistErasure implies is_erasure == true (legacy global.rs:267-269).
+            (SetupType::DistErasure, true, true, false),
+            (SetupType::ErasureSD, false, false, true),
+        ];
 
-            let (want_erasure, want_dist, want_sd) = legacy_booleans(&setup_type);
-            assert_eq!(ctx.is_erasure().await, want_erasure, "is_erasure mismatch for {setup_type:?}");
-            assert_eq!(ctx.is_dist_erasure().await, want_dist, "is_dist_erasure mismatch for {setup_type:?}");
-            assert_eq!(ctx.is_erasure_sd().await, want_sd, "is_erasure_sd mismatch for {setup_type:?}");
+        for (input, want_erasure, want_dist, want_sd) in cases {
+            let ctx = InstanceContext::new();
+            ctx.update_erasure_type(input.clone()).await;
+            assert_eq!(ctx.is_erasure().await, want_erasure, "is_erasure for {input:?}");
+            assert_eq!(ctx.is_dist_erasure().await, want_dist, "is_dist_erasure for {input:?}");
+            assert_eq!(ctx.is_erasure_sd().await, want_sd, "is_erasure_sd for {input:?}");
         }
     }
 
+    // A fresh context (before any update) reflects the initial all-false state.
     #[tokio::test]
     async fn fresh_context_is_all_false() {
         let ctx = InstanceContext::new();
@@ -187,6 +182,8 @@ mod tests {
         assert!(!ctx.is_erasure_sd().await);
     }
 
+    // bootstrap_ctx() is a stable process singleton: repeated calls return the
+    // same Arc, so a startup write is visible to a later read through it.
     #[tokio::test]
     async fn bootstrap_ctx_is_stable_singleton() {
         let a = bootstrap_ctx();
@@ -194,44 +191,42 @@ mod tests {
         assert!(Arc::ptr_eq(&a, &b), "bootstrap_ctx must return the same Arc");
     }
 
+    // Two independent contexts do not share erasure state — the property that
+    // lets two ECStore instances (each carrying its own ctx) stay isolated.
     #[tokio::test]
     async fn distinct_contexts_do_not_share_state() {
-        let a = InstanceContext::new();
-        let b = InstanceContext::new();
-        a.set_erasure_kind(SetupType::DistErasure).await;
-        b.set_erasure_kind(SetupType::ErasureSD).await;
+        let ctx_a = Arc::new(InstanceContext::new());
+        let ctx_b = Arc::new(InstanceContext::new());
+        ctx_a.update_erasure_type(SetupType::DistErasure).await;
+        ctx_b.update_erasure_type(SetupType::ErasureSD).await;
 
-        assert!(a.is_dist_erasure().await);
-        assert!(!a.is_erasure_sd().await);
-        assert!(b.is_erasure_sd().await);
-        assert!(!b.is_dist_erasure().await);
+        assert!(ctx_a.is_dist_erasure().await && ctx_a.is_erasure().await);
+        assert!(!ctx_a.is_erasure_sd().await);
+
+        assert!(ctx_b.is_erasure_sd().await);
+        assert!(!ctx_b.is_erasure().await && !ctx_b.is_dist_erasure().await);
     }
 
-    /// Slice3: the bootstrap context must reuse the process-global lock manager,
-    /// so single-instance locking is unchanged (other direct callers of
-    /// `get_global_lock_manager()` lock in the same namespace as `SetDisks`).
+    // Single-instance zero-change: the bootstrap context's lock manager is the
+    // very same Arc the process singleton hands out, so the lock namespace is
+    // unchanged from before Slice 3.
     #[tokio::test]
-    async fn bootstrap_ctx_adopts_global_lock_manager() {
-        let ctx = bootstrap_ctx();
+    async fn bootstrap_lock_manager_aliases_process_singleton() {
         assert!(
-            Arc::ptr_eq(&ctx.local_lock_manager(), &rustfs_lock::get_global_lock_manager()),
-            "bootstrap ctx must reuse the process-global lock manager"
+            Arc::ptr_eq(&bootstrap_ctx().lock_manager(), &get_global_lock_manager()),
+            "bootstrap context must alias the process lock-manager singleton"
         );
     }
 
-    /// Slice3: a freshly-minted context gets its OWN lock manager — the seam
-    /// that gives a second instance an isolated lock namespace.
+    // Two independent contexts own distinct lock managers — the property that
+    // stops two instances from falsely contending on same-named objects.
     #[tokio::test]
-    async fn fresh_context_has_isolated_lock_manager() {
-        let a = InstanceContext::new();
-        let b = InstanceContext::new();
+    async fn distinct_contexts_have_distinct_lock_managers() {
+        let ctx_a = InstanceContext::new();
+        let ctx_b = InstanceContext::new();
         assert!(
-            !Arc::ptr_eq(&a.local_lock_manager(), &b.local_lock_manager()),
-            "two fresh contexts must have distinct lock managers"
-        );
-        assert!(
-            !Arc::ptr_eq(&a.local_lock_manager(), &rustfs_lock::get_global_lock_manager()),
-            "a fresh context must not share the process-global lock manager"
+            !Arc::ptr_eq(&ctx_a.lock_manager(), &ctx_b.lock_manager()),
+            "fresh contexts must not share a lock manager"
         );
     }
 }
